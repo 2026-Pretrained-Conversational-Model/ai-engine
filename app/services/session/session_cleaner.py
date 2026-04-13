@@ -14,6 +14,7 @@ from app.services.session.session_manager import SessionManager
 from app.services.embedding.faiss_store import FaissStore
 from app.storage.file_store import remove_session_files
 from app.core.logger import get_logger
+from app.services.pdf.preprocess_registry import PreprocessRegistry
 
 logger = get_logger(__name__)
 
@@ -24,5 +25,7 @@ async def purge_session(session_id: str, reason: str) -> None:
     FaissStore.instance().drop(session_id)
     # 2. remove uploaded files on disk
     remove_session_files(session_id)
-    # 3. drop in-memory session blob
+    # 3. cancel/clear background preprocess task registry entry
+    PreprocessRegistry.instance().clear(session_id)
+    # 4. drop in-memory session blob
     await SessionManager.instance().delete(session_id)

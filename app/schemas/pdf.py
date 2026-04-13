@@ -12,6 +12,7 @@ app/schemas/pdf.py
 from datetime import datetime
 from typing import List, Optional
 from pydantic import BaseModel, Field
+from app.core.constants import IngestStatus
 
 
 class PdfMeta(BaseModel):
@@ -22,6 +23,7 @@ class PdfMeta(BaseModel):
     file_size: int
     page_count: int
     mime_type: str = "application/pdf"
+    file_hash: str = ""
 
 
 class SectionSummary(BaseModel):
@@ -50,3 +52,9 @@ class PdfState(BaseModel):
     active_pdf: Optional[PdfMeta] = None
     doc_summary: DocSummary = Field(default_factory=DocSummary)
     pdf_index: PdfIndex = Field(default_factory=PdfIndex)
+
+    # ---- Ingestion state -----------------------------------------------------
+    # 업로드된 PDF가 현재 어느 단계까지 준비되었는지 기록한다.
+    # 라우터가 RAG 필요로 판단하면 READY가 될 때까지 기다린다.
+    ingest_status: IngestStatus = IngestStatus.IDLE
+    ingest_error: str = ""

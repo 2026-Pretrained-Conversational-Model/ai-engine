@@ -7,22 +7,32 @@ app/services/conversation/multiturn_resolver.py
 
       결과는 retrieval 및 prompt builder에 전달됨
 
-      ※ 멀티턴의 핵심 로직
-         (요구사항 #7 / #9: 멀티턴 우선)
+      ※ baseline에서는 완전한 LLM 재작성 대신,
+         최근 assistant/user 발화를 이용한 가벼운 치환만 수행한다.
+         이 모듈은 추후 Search Prep 단계의 실제 LLM rewriter로 대체 가능하다.
 
 TODO:
-    [ ] 간결한 resolver 전용 프롬프트로 LLM 호출,
-         (session, msg_hash) 기준 캐싱
-    [ ] 검색 성능 향상을 위한 한국어 조사 제거 처리
-    [ ] `resolved_query`와 `clarification_needed` 플래그 함께 반환
+    [ ] resolver 전용 few-shot LLM prompt 적용
+    [ ] `resolved_query`와 `clarification_needed`를 함께 반환하도록 확장
 """
 from app.schemas.session import Session
 
 
 def resolve(session: Session, user_text: str) -> str:
-    """
-    Returns a context-resolved version of `user_text`.
-    Currently a no-op pass-through; replace with LLM call.
-    """
-    # TODO: implement real resolution
-    return user_text
+    text = user_text.strip()
+    lowered = text.lower()
+
+    # 최근 메시지 중 가장 마지막 assistant/user 발화를 참조 후보로 사용한다.
+    recent = session.conversation.recent_messages[-2:] if session.conversation.recent_messages else []
+    last_context = " ".join(m.text for m in recent).strip()
+
+    # resolved_refs가 있으면 우선 사용한다.
+    resolved_refs = session.conversation.summary.structured.established_facts
+    ref_hint = resolved_refs[-1] if resolved_refs else session.conversation.current_topic
+
+    if any(token in lowered for token in ["그거", "그 부분", "그 논문", "그 표", "아까", "that", "it"]):
+        anchor = ref_hint or last_context
+        if anchor:
+            return f"{text} (reference: {anchor[:200]})"
+
+    return text

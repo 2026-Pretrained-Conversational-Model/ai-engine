@@ -4,8 +4,10 @@ app/api/endpoints/upload.py
 역할: POST /upload — Node.js가 파일 경로 대신
       PDF 바이트를 직접 전달하는 경우(multipart) 처리
 
-      업로드된 파일을 로컬 저장소에 저장하고,
-      즉시 세션에 반영(ingest)
+정책:
+- /upload는 문서를 세션에 연결하고 즉시 background ingest를 시작한다.
+- 기본 응답은 빠른 ack를 반환하며, 필요 시 `wait_until_ready=true`로
+  완전한 인덱싱 완료까지 기다리는 동기 모드도 지원한다.
 
 TODO:
     [ ] PDF가 아닌 mimetype은 거부
@@ -13,33 +15,36 @@ TODO:
 """
 from fastapi import APIRouter, UploadFile, File, Form
 from app.services.session.session_getter import get_or_create
-from app.services.session.session_updater import save_session
-from app.services.pdf.pdf_saver import save_pdf
-from app.services.pdf.pdf_parser import parse_pdf
-from app.services.pdf.pdf_chunker import chunk_pages
-from app.services.pdf.pdf_summarizer import summarize_document
-from app.services.pdf.pdf_indexer import index_chunks
-from app.core.constants import ResourceType
+from app.services.pdf.pdf_ingest import attach_pdf_to_session, ensure_pdf_ingest_started, wait_for_pdf_ready
 
 router = APIRouter()
 
 
 @router.post("")
-async def upload(session_id: str = Form(...), file: UploadFile = File(...)) -> dict:
+async def upload(
+    session_id: str = Form(...),
+    file: UploadFile = File(...),
+    wait_until_ready: bool = Form(False),
+) -> dict:
     data = await file.read()
     session = await get_or_create(session_id)
 
-    meta = save_pdf(session_id, file.filename or "upload.pdf", data)
-    page_count, pages = parse_pdf(meta.file_path)
-    meta.page_count = page_count
-    chunks = chunk_pages(meta.file_id, pages)
+    meta = await attach_pdf_to_session(session, file.filename or "upload.pdf", data)
+    await ensure_pdf_ingest_started(session)
 
-    session.pdf_state.active_pdf = meta
-    session.pdf_state.pdf_index.chunks = chunks
-    session.pdf_state.doc_summary = await summarize_document(pages)
-    index_chunks(session_id, chunks)
-    session.runtime_state.active_resource_type = ResourceType.PDF
-    session.runtime_state.active_pdf_id = meta.file_id
+    if wait_until_ready:
+        await wait_for_pdf_ready(session_id)
+        session = await get_or_create(session_id)
+        return {
+            "file_id": meta.file_id,
+            "page_count": session.pdf_state.active_pdf.page_count if session.pdf_state.active_pdf else 0,
+            "ingest_status": session.pdf_state.ingest_status,
+            "ready": True,
+        }
 
-    await save_session(session)
-    return {"file_id": meta.file_id, "page_count": page_count}
+    return {
+        "file_id": meta.file_id,
+        "page_count": 0,
+        "ingest_status": "running",
+        "ready": False,
+    }

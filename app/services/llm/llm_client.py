@@ -1,11 +1,11 @@
 """
 app/services/llm/llm_client.py
 ------------------------------
-역할: AWS SageMaker 엔드포인트를 통한 텍스트 LLM 호출
-      해당 엔드포인트는 "zero-orchestration" 방식으로 동작하며,
-      프롬프트와 파라미터만 전달하면 텍스트를 생성하여 반환함
+역할: AWS SageMaker 엔드포인트를 통한 텍스트 LLM 호출.
 
-      별도의 tool 호출이나 function calling은 사용하지 않음
+baseline 추가 정책:
+- 엔드포인트가 비어 있으면 로컬 heuristic fallback 응답을 사용한다.
+- 이렇게 하면 인프라가 준비되지 않은 개발 단계에서도 전체 파이프라인을 검증할 수 있다.
 
 TODO:
     [ ] InvokeEndpointWithResponseStream을 통한 스트리밍 지원
@@ -33,6 +33,9 @@ class LLMClient:
 
     @classmethod
     async def generate(cls, prompt: str, max_new_tokens: int = 1024) -> str:
+        if not settings.SAGEMAKER_LLM_ENDPOINT:
+            return cls._fallback(prompt)
+
         payload = {
             "inputs": prompt,
             "parameters": {
@@ -48,10 +51,27 @@ class LLMClient:
                 Body=json.dumps(payload),
             )
             body = json.loads(resp["Body"].read())
-            # Adjust to match your container's output format
             if isinstance(body, list) and body and "generated_text" in body[0]:
                 return body[0]["generated_text"]
             return body.get("generated_text", str(body))
         except Exception as e:
             logger.exception("LLM invoke failed: %s", e)
-            return "[LLM invocation error]"
+            return cls._fallback(prompt)
+
+    @staticmethod
+    def _fallback(prompt: str) -> str:
+        """개발 환경용 간단한 응답.
+
+        TODO:
+            [ ] 실제 로컬 모델 서버 연동 또는 mock framework로 교체
+        """
+        marker = "[Current User Question]"
+        if marker in prompt:
+            question = prompt.split(marker, 1)[-1].strip()
+        else:
+            question = prompt[-300:]
+        return (
+            "[baseline-fallback-answer]\n"
+            f"요청을 처리했지만 현재 원격 LLM 엔드포인트가 설정되지 않았습니다.\n"
+            f"해석한 질문: {question[:300]}"
+        )

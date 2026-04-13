@@ -15,7 +15,7 @@ from app.storage.file_store import save_bytes
 from app.utils.id_generator import new_pdf_id
 
 
-def save_pdf(session_id: str, file_name: str, data: bytes) -> PdfMeta:
+def save_pdf(session_id: str, file_name: str, data: bytes, file_hash: str = "") -> PdfMeta:
     path = save_bytes(session_id, file_name, data)
     return PdfMeta(
         file_id=new_pdf_id(),
@@ -25,4 +25,5 @@ def save_pdf(session_id: str, file_name: str, data: bytes) -> PdfMeta:
         file_size=os.path.getsize(path),
         page_count=0,           # filled in by parser
         mime_type="application/pdf",
+        file_hash=file_hash,
     )
