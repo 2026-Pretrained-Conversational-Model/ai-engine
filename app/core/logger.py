@@ -55,7 +55,6 @@ def log_memory(logger, session, label: str):
 
         payload = {
             "label": label,
-            "session_id": getattr(session, "session_id", None),
             "memory": memory.model_dump() if hasattr(memory, "model_dump") else str(memory),
             "pdf": pdf.model_dump() if hasattr(pdf, "model_dump") else str(pdf),
             "runtime": runtime.model_dump() if hasattr(runtime, "model_dump") else str(runtime),
