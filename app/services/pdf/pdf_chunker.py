@@ -11,19 +11,32 @@ TODO:
 from typing import List
 from app.schemas.pdf import PdfChunk
 from app.core.config import settings
-
+# RecursiveCharacterTextSplitter 추가
+from langchain_text_splitters import RecursiveCharacterTextSplitter
 
 def chunk_pages(file_id: str, pages: List[str]) -> List[PdfChunk]:
     chunks: List[PdfChunk] = []
-    size = settings.PDF_CHUNK_SIZE
-    overlap = settings.PDF_CHUNK_OVERLAP
     counter = 0
+
+    # [수정] RecursiveCharacterTextSplitter 사용
+    # 변경: splitter.split_text(text)
+    #       → separators 우선순위대로 자연스러운 경계에서 분리
+    splitter = RecursiveCharacterTextSplitter(
+        chunk_size=settings.PDF_CHUNK_SIZE,
+        chunk_overlap=settings.PDF_CHUNK_OVERLAP,
+        separators=["\n\n", "\n", ".", " ", ""],
+    )
+
     for page_idx, text in enumerate(pages, start=1):
         if not text:
             continue
-        i = 0
-        while i < len(text):
-            piece = text[i : i + size]
+        
+        # [수정] splitter로 페이지 텍스트 분할
+        pieces = splitter.split_text(text)
+
+        for piece in pieces:
+            if not piece.strip():
+                continue
             counter += 1
             chunks.append(
                 PdfChunk(
@@ -33,5 +46,5 @@ def chunk_pages(file_id: str, pages: List[str]) -> List[PdfChunk]:
                     text=piece,
                 )
             )
-            i += size - overlap
+
     return chunks
