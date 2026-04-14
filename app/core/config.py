@@ -46,7 +46,7 @@ class Settings(BaseSettings):
     # Embedding
     EMBEDDING_MODEL_NAME: str = "jhgan/ko-sroberta-multitask"
     EMBEDDING_DEVICE: str = "cpu"
-    EMBEDDING_DIM: int = 1024
+    EMBEDDING_DIM: int = 768
 
     # PDF / RAG
     PDF_CHUNK_SIZE: int = 800
