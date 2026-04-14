@@ -1,55 +1,101 @@
 """
 app/services/summary/structured_updater.py
 ------------------------------------------
-역할: 구조화된 요약 필드 업데이트:
-      goal / established_facts / current_focus / unresolved_questions
+역할: structured summary(JSON) 증분 갱신.
+      goal / established_facts / current_focus / unresolved_questions 4개 필드.
 
-현재 baseline 전략:
-- goal          : last_user_intent를 복사
-- current_focus : current_topic을 복사
-- established_facts:
-    active PDF, 최근 문서 요약, 최근 assistant 답변 일부를 facts로 적재
-- unresolved_questions:
-    마지막 user turn이 질문형이면 해당 내용을 유지
-
-TODO:
-    [ ] StructuredSummary 형식(JSON)에 맞는 실제 LLM 호출 구현
-    [ ] established_facts 추가 시 신뢰도/출처 정보를 함께 보관
+변경점:
+- 이전 버전: no-op stub
+- 이번 버전: LocalModelRegistry에 "summary" role이 등록돼 있으면 LLM 호출.
+             모델 응답을 JSON으로 파싱해서 StructuredSummary 필드에 반영.
+             파싱 실패 시 기존 값 유지.
 """
+from __future__ import annotations
+
+import asyncio
+import json
+import re
+
+from app.core.logger import get_logger
 from app.schemas.session import Session
+from app.schemas.conversation import StructuredSummary
+from app.services.llm.local_registry import LocalModelRegistry
+
+logger = get_logger(__name__)
+
+
+_STRUCTURED_PROMPT = """You maintain a structured JSON summary of a multi-turn chatbot conversation.
+
+Previous structured summary:
+{prev_json}
+
+Latest turns:
+{turns}
+
+Return an UPDATED JSON object with EXACTLY these keys:
+- "goal": one sentence describing the overall goal of the conversation
+- "established_facts": list of short facts already agreed upon (dedup)
+- "current_focus": one phrase describing the sub-topic currently being discussed
+- "unresolved_questions": list of open questions the user still needs answered
+
+Rules:
+- Output valid JSON only, no markdown fences, no extra text.
+- Keep each list to at most 5 items.
+- Use Korean for the field values when the conversation is in Korean."""
+
+
+_JSON_RE = re.compile(r"\{.*\}", re.DOTALL)
+
+
+def _extract_json(text: str) -> dict | None:
+    if not text:
+        return None
+    match = _JSON_RE.search(text)
+    if not match:
+        return None
+    try:
+        return json.loads(match.group(0))
+    except json.JSONDecodeError:
+        return None
 
 
 async def update_structured(session: Session) -> None:
-    structured = session.conversation.summary.structured
+    if not LocalModelRegistry.has("summary"):
+        return
 
-    structured.goal = session.conversation.last_user_intent or structured.goal
-    structured.current_focus = session.conversation.current_topic or structured.current_focus
+    recent = session.conversation.recent_messages[-4:]
+    if not recent:
+        return
 
-    facts = list(structured.established_facts)
-    if session.pdf_state.active_pdf:
-        facts.append(f"active_pdf={session.pdf_state.active_pdf.file_name}")
-    if session.pdf_state.doc_summary.one_line:
-        facts.append(f"doc_summary={session.pdf_state.doc_summary.one_line[:120]}")
-    if session.conversation.recent_messages:
-        last_assistant = next(
-            (m.text for m in reversed(session.conversation.recent_messages) if m.role.value == "assistant"),
-            "",
-        )
-        if last_assistant:
-            facts.append(f"last_answer={last_assistant[:120]}")
-
-    # 중복 제거 + 최근 5개 유지
-    deduped = []
-    for fact in facts:
-        if fact and fact not in deduped:
-            deduped.append(fact)
-    structured.established_facts = deduped[-5:]
-
-    unresolved = []
-    last_user = next(
-        (m.text for m in reversed(session.conversation.recent_messages) if m.role.value == "user"),
-        "",
+    turns_text = "\n".join(f"{m.role.value}: {m.text}" for m in recent)
+    prev = session.conversation.summary.structured
+    prev_json = json.dumps(
+        {
+            "goal": prev.goal,
+            "established_facts": prev.established_facts,
+            "current_focus": prev.current_focus,
+            "unresolved_questions": prev.unresolved_questions,
+        },
+        ensure_ascii=False,
     )
-    if "?" in last_user or "뭐" in last_user or "왜" in last_user or "어떻게" in last_user:
-        unresolved.append(last_user[:160])
-    structured.unresolved_questions = unresolved[-3:]
+    prompt = _STRUCTURED_PROMPT.format(prev_json=prev_json, turns=turns_text)
+
+    try:
+        raw = await asyncio.to_thread(
+            LocalModelRegistry.generate, "summary", prompt, 400
+        )
+        parsed = _extract_json(raw)
+        if not parsed:
+            logger.warning("structured updater: unparseable output %r", (raw or "")[:120])
+            return
+
+        session.conversation.summary.structured = StructuredSummary(
+            goal=str(parsed.get("goal", prev.goal))[:200],
+            established_facts=[str(x)[:200] for x in (parsed.get("established_facts") or [])][:5],
+            current_focus=str(parsed.get("current_focus", prev.current_focus))[:200],
+            unresolved_questions=[
+                str(x)[:200] for x in (parsed.get("unresolved_questions") or [])
+            ][:5],
+        )
+    except Exception as e:
+        logger.exception("structured updater failed: %s", e)
