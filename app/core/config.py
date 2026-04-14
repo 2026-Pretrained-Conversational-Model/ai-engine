@@ -1,13 +1,14 @@
 """
 app/core/config.py
 ------------------
-역할: 환경 변수 기반 설정의 단일 진실 소스(Single Source of Truth)
-      프로세스 시작 시 한 번 로드되며,
-      `settings`를 통해 각 서비스에 주입됨
+역할: 환경 변수 기반 설정 단일 소스
+      프로세스 시작 시 1회 로드되고 settings로 주입됨
 
-TODO:
-    [ ] 환경별 설정 파일 추가 (.env.dev, .env.prod)
-    [ ] 시작 시 SageMaker 엔드포인트 연결 가능 여부 검증
+TODO : 김예슬 (완)
+변경점(Colab 지원):
+- LLM_BACKEND 추가: "sagemaker" | "local"
+  - "sagemaker": 기존 boto3 엔드포인트 호출 (운영)
+  - "local":     LocalModelRegistry에 등록된 HuggingFace 모델을 in-process 호출 (Colab/개발)
 """
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
@@ -30,7 +31,13 @@ class Settings(BaseSettings):
     LOCAL_FILE_DIR: str = "/tmp/ai-orchestrator"
     DELETE_FILE_ON_EXPIRE: bool = True
 
-    # SageMaker
+    # ---- LLM backend selector ------------------------------------------------
+    # "sagemaker": 운영용. boto3로 SageMaker endpoint 호출.
+    # "local":     개발/Colab용. LocalModelRegistry에 등록된 HF 모델 직접 호출.
+    # LLM_BACKEND: str = "sagemaker"
+    LLM_BACKEND: str = "local"
+
+    # SageMaker (LLM_BACKEND=sagemaker 일 때만 사용)
     AWS_REGION: str = "ap-northeast-2"
     SAGEMAKER_LLM_ENDPOINT: str = ""
     SAGEMAKER_VLM_ENDPOINT: str = ""

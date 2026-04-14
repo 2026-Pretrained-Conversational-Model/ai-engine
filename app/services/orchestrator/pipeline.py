@@ -3,23 +3,19 @@ app/services/orchestrator/pipeline.py
 -------------------------------------
 역할: 전체 흐름을 담당하는 핵심 파이프라인.
 
-최종 baseline 설계 포인트:
-1. PDF 업로드가 있는 턴에서는 무거운 문서 전처리(parse/chunk/summary/index)를
-   background ingest task로 바로 시작한다.
-2. 동시에 user message append / resolve / intent / topic / router 판정을 먼저 수행한다.
+변경점(이 커밋):
+- judge_route()가 async 함수로 바뀜에 따라,
+  router_task 생성 시 asyncio.to_thread 래핑을 제거하고
+  직접 judge_route 코루틴을 create_task로 스케줄링한다.
+  (resolve/intent/topic은 여전히 동기 함수라 to_thread 유지.)
+
+기존 설계 포인트는 유지:
+1. PDF 업로드가 있는 턴에서는 무거운 문서 전처리를 background ingest task로 시작.
+2. 동시에 user message append / resolve / intent / topic / router 판정을 먼저 수행.
 3. 라우터가 RAG 또는 document summary가 필요한 경로를 선택한 경우에만
    ingest task 완료까지 기다린다.
 4. Memory State Generator만 학습 모듈로 가정하고,
-   나머지(router / search prep / retriever / answer)는 비학습 baseline으로 유지한다.
-
-이 구조 덕분에:
-- 단순 정의 질문은 PDF 전처리 완료를 기다리지 않고 빠르게 DIRECT_ANSWER 가능
-- 문서 검색이 필요한 질문만 준비 완료까지 await 후 RAG 수행
-
-TODO:
-    [ ] router 결과와 실제 answer 품질을 비교하여 auto-label 로그 저장
-    [ ] 문서 준비 상태(progress %)를 Node.js에 실시간 push
-    [ ] Search Prep 이후 query cache / retrieval cache를 실제 도입
+   나머지(router / search prep / retriever / answer)는 비학습 baseline으로 유지.
 """
 from __future__ import annotations
 
@@ -64,16 +60,14 @@ async def run(req: ChatRequest) -> ChatResponse:
     append_message(session, Role.USER, req.user_text)
 
     # 4) memory-side lightweight updates + router judge in parallel ------------
-    #    resolve/intent/topic은 무겁지 않지만 개념적으로는 Memory State Generator 입력을
-    #    구성하는 단계다. PDF ingest와 동시에 먼저 수행할 수 있다.
     resolved_task = asyncio.create_task(asyncio.to_thread(resolve, session, req.user_text))
     intent_task = asyncio.create_task(asyncio.to_thread(extract_intent, session, req.user_text))
     topic_task = asyncio.create_task(asyncio.to_thread(update_topic, session, req.user_text))
 
-    # 이미지가 있는 경우는 router와 별개로 최종 모델 선택에만 사용한다.
     has_attachment = bool(session.pdf_state.active_pdf)
+    # judge_route is now an async coroutine (it may call a local LLM under the hood)
     router_task = asyncio.create_task(
-        asyncio.to_thread(judge_route, session, req.user_text, has_attachment)
+        judge_route(session, req.user_text, has_attachment)
     )
 
     resolved = await resolved_task
@@ -93,7 +87,6 @@ async def run(req: ChatRequest) -> ChatResponse:
         )
     else:
         if router_decision in {RouterDecision.RETRIEVE_DOC, RouterDecision.SEARCH_PREP_THEN_RETRIEVE}:
-            # 문서 검색이 필요한 경우에만 background ingest 완료를 기다린다.
             await wait_for_pdf_ready(req.session_id)
             session = await get_or_create(req.session_id)
 
