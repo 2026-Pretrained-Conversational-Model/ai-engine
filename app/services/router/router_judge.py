@@ -55,13 +55,13 @@ def _judge_route_heuristic(
 
     if any(token in q for token in _REFERENCE_HINTS):
         if not session.conversation.recent_messages and not summary_exists:
-            return RouterDecision.ASK_CLARIFICATION
-        return RouterDecision.DIRECT_ANSWER
+            return RouterDecision.DIRECT_ANSWER  #[김예슬] test 용으로 고정
+        return RouterDecision.DIRECT_ANSWER  #[김예슬] test 용으로 고정
 
     if len(q) <= 6 and not active_pdf and not session.conversation.recent_messages:
-        return RouterDecision.ASK_CLARIFICATION
+        return RouterDecision.DIRECT_ANSWER  #[김예슬] test 용으로 고정
 
-    return RouterDecision.DIRECT_ANSWER
+    return RouterDecision.DIRECT_ANSWER #[김예슬] test 용으로 고정
 
 
 # --- LLM judge ---------------------------------------------------------------
