@@ -73,7 +73,7 @@ async def run(req: ChatRequest) -> ChatResponse:
     # 1) session load ----------------------------------------------------------
     log_stage_start(logger, "SESSION_LOAD", session_id=req.session_id)
     session = await get_or_create(req.session_id)
-    log_stage_end(logger, "SESSION_LOAD", session_id=session.session_id)
+    log_stage_end(logger, "SESSION_LOAD", session_id=req.session_id)
     log_memory(logger, session, "after_session_load")
 
     # 2) optional PDF attach + background ingest start -------------------------
