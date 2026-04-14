@@ -44,7 +44,7 @@ class Settings(BaseSettings):
     SAGEMAKER_TIMEOUT_SEC: int = 60
 
     # Embedding
-    EMBEDDING_MODEL_NAME: str = "BAAI/bge-m3"
+    EMBEDDING_MODEL_NAME: str = "jhgan/ko-sroberta-multitask"
     EMBEDDING_DEVICE: str = "cpu"
     EMBEDDING_DIM: int = 1024
 

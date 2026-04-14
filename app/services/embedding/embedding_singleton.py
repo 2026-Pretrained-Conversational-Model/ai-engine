@@ -7,7 +7,7 @@ app/services/embedding/embedding_singleton.py
     
     - 임베딩 벡터나 FAISS를 여러 번 불러오지 않도록 설정
 
-변경사항 (baseline 반영):
+변경사항 (baseline 반영) 이지선:
     [수정] embed_documents() 추가
           배치 임베딩 + normalize_embeddings=True + 진행바
     [수정] embed_query() 추가
