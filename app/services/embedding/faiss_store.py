@@ -12,6 +12,9 @@ TODO:
 """
 from __future__ import annotations
 
+import hashlib
+import pickle
+from pathlib import Path
 from typing import Dict, List, Tuple
 import numpy as np
 
@@ -59,6 +62,11 @@ class FaissStore:
         self._indexes: Dict[str, Tuple[object, List[str]]] = {}
         if not _FAISS_AVAILABLE:
             logger.warning("faiss is not available; using numpy fallback index")
+
+        # [수정] md5 캐시 디렉토리 초기화
+        # chunk_size 변경 시 이 디렉토리 삭제 후 재실행 필요
+        self._cache_dir = Path(getattr(settings, "FAISS_CACHE_DIR", "./faiss_cache"))
+        self._cache_dir.mkdir(parents=True, exist_ok=True)
 
     @classmethod
     def instance(cls) -> "FaissStore":
