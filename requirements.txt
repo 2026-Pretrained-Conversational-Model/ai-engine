@@ -12,3 +12,4 @@ numpy==1.26.4
 torch>=2.1.0
 transformers>=4.40.0
 accelerate>=0.27.0
+langchain-text-splitters
