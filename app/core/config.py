@@ -34,12 +34,14 @@ class Settings(BaseSettings):
     DELETE_FILE_ON_EXPIRE: bool = True
 
     # LLM backend
-    LLM_BACKEND: str = "local"
+    LLM_BACKEND: str = "sagemaker"  # "local" or "sagemaker"
     AWS_REGION: str = "ap-northeast-2"
-    SAGEMAKER_LLM_ENDPOINT: str = ""
+    SAGEMAKER_ANSWER_ENDPOINT: str = ""
+    SAGEMAKER_ROUTER_ENDPOINT: str = ""
+    SAGEMAKER_SUMMARY_ENDPOINT: str = ""
     SAGEMAKER_VLM_ENDPOINT: str = ""
-    SAGEMAKER_TIMEOUT_SEC: int = 60
 
+    SAGEMAKER_TIMEOUT_SEC: int = 60
     # Embedding
     EMBEDDING_MODEL_NAME: str = "jhgan/ko-sroberta-multitask"
     EMBEDDING_DEVICE: str = "cpu"
