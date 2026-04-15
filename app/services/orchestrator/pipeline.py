@@ -3,7 +3,7 @@ app/services/orchestrator/pipeline.py
 -------------------------------------
 역할: 전체 흐름을 담당하는 핵심 파이프라인.
 
-변경점(이 커밋):
+변경점:
 - judge_route()가 async 함수로 바뀜에 따라,
   router_task 생성 시 asyncio.to_thread 래핑을 제거하고
   직접 judge_route 코루틴을 create_task로 스케줄링한다.
@@ -55,6 +55,7 @@ from app.services.pdf.pdf_ingest import (
 )
 from app.services.pdf.pdf_retriever import retrieve_relevant
 from app.services.router.router_judge import judge_route
+from app.services.memory.memory_state_generator import update_memory_state
 
 logger = get_logger(__name__)
 
@@ -271,6 +272,21 @@ async def run(req: ChatRequest) -> ChatResponse:
         answer_type=str(answer_type),
     )
     log_memory(logger, session, "after_finalize")
+
+    # 7) Memory State Generator -----------------------------------------------
+    if not expired:
+        log_stage_start(logger, "MEMORY_STATE_GENERATOR")
+        session = await get_or_create(req.session_id)
+        await update_memory_state(session)
+        from app.services.session.session_updater import save_session
+        await save_session(session)
+        log_stage_end(
+            logger,
+            "MEMORY_STATE_GENERATOR",
+            narrative_length=len(session.conversation.summary.narrative),
+            topic=session.conversation.current_topic,
+        )
+        log_memory(logger, session, "after_memory_state_generator")
 
     response = ChatResponse(
         session_id=req.session_id,
