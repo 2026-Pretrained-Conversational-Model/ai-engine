@@ -74,11 +74,11 @@ def _judge_route_heuristic(
 
     if any(token in q for token in _REFERENCE_HINTS):
         if not session.conversation.recent_messages and not summary_exists:
-            return RouterDecision.ASK_CLARIFICATION
+            return RouterDecision.DIRECT_ANSWER
         return RouterDecision.DIRECT_ANSWER
 
     if len(q) <= 6 and not active_pdf and not session.conversation.recent_messages:
-        return RouterDecision.ASK_CLARIFICATION
+        return RouterDecision.DIRECT_ANSWER
 
     return RouterDecision.DIRECT_ANSWER
 
@@ -124,7 +124,7 @@ def _map_to_router_decision(
     if rag_response.reason_code == RagReasonCode.AMBIGUOUS_BUT_NOT_RAG:
         summary_exists = bool(session.pdf_state.doc_summary.one_line)
         if not session.conversation.recent_messages and not summary_exists:
-            return RouterDecision.ASK_CLARIFICATION
+            return RouterDecision.DIRECT_ANSWER
 
     return RouterDecision.DIRECT_ANSWER
 

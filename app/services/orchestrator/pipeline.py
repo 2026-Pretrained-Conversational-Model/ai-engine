@@ -138,7 +138,7 @@ async def run(req: ChatRequest) -> ChatResponse:
     has_attachment = bool(session.pdf_state.active_pdf)
     router_task = asyncio.create_task(
         judge_route(session, req.user_text, has_attachment)
-    )
+    ) ## [진주용] : 시작부분
 
     resolved = await resolved_task
     intent_result = await intent_task
