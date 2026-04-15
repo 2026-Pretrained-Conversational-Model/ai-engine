@@ -2,29 +2,31 @@
 app/services/orchestrator/response_finalizer.py
 -----------------------------------------------
 역할: LLM 호출 이후 후처리 단계.
-      1. assistant 메시지를 recent_messages에 추가
-      2. memory_state_generator 호출 (narrative + structured 갱신)
-      3. 세션 저장
-      4. 메모리 제한 검사 → 초과 시 세션 삭제(purge)
+      1. assistant 메시지를 recent_messages에 추가  (매 턴)
+      2. 세션 저장                                     (매 턴)
+      3. user 턴 % N == 0 이면 memory update task를  (3턴마다)
+         fire-and-forget으로 스케줄
+      4. 메모리 제한 검사 → 초과 시 세션 삭제
 
-v8.1 변경 (메모리 비어있는 문제 해결):
-- v8에서 fire-and-forget (asyncio.create_task)으로 분리했는데,
-  Colab의 run_until_complete 모델에서는 pipeline_run이 리턴되면
-  이벤트 루프가 멈추면서 background task가 실행 기회를 못 잡았음.
-  → 모든 턴에서 narrative="", established_facts=[] 인 상태가 유지.
+v12 설계 — 한 줄 요약:
+    memory read는 prompt_builder가 매 턴 수행 (summary 필드 조회).
+    memory WRITE(LLM 호출해서 요약 재생성)만 3턴마다 1번, 병렬.
 
-- 해법: memory 갱신을 다시 await으로 되돌림.
-  이전(v7)에는 narrative + structured 두 번 순차 호출이라 21~50초 걸렸지만,
-  v8에서 memory_state_generator 단일 호출(1회)로 통합했으므로
-  await해도 5~8초. 이전의 1/6 수준.
+환경 분기 제거:
+- 이전엔 MEMORY_UPDATE_ASYNC 설정으로 Colab=await / FastAPI=background 분기.
+- v12부터 무조건 create_task()로 background. Colab에서도 작동하려면
+  노트북이 "영구 이벤트 루프 헬퍼"를 써야 함 (notebooks/colab_loop_helper.py 참고).
+- create_task가 실패(이벤트 루프 없음)하면 경고만 남기고 skip. 다음 3턴 주기에 또 시도.
 
-  FastAPI 운영 환경에서 latency를 더 줄이고 싶으면
-  MEMORY_UPDATE_ASYNC=true 설정으로 fire-and-forget 모드를 켤 수 있게 옵션을 남겨둠.
+Race 방지:
+- 같은 session_id에 대한 memory update는 asyncio.Lock으로 직렬화.
+- 다른 세션은 병렬 가능.
 """
 from __future__ import annotations
 
 import asyncio
-from typing import Optional, Set, Tuple
+import json
+from typing import Dict, Optional, Set, Tuple
 
 from app.core.config import settings
 from app.core.logger import get_logger
@@ -35,12 +37,27 @@ from app.services.session.session_updater import save_session
 from app.services.session.memory_monitor import is_over_limit
 from app.services.session.session_cleaner import purge_session
 from app.services.session.session_getter import get_or_create
-import json
+
 logger = get_logger(__name__)
 
 
 # ---------------------------------------------------------------------------
-# Background task registry (fire-and-forget 모드에서만 사용)
+# Per-session lock (race 방지)
+# ---------------------------------------------------------------------------
+
+_session_locks: Dict[str, asyncio.Lock] = {}
+
+
+def _lock_for(session_id: str) -> asyncio.Lock:
+    lock = _session_locks.get(session_id)
+    if lock is None:
+        lock = asyncio.Lock()
+        _session_locks[session_id] = lock
+    return lock
+
+
+# ---------------------------------------------------------------------------
+# Background task registry (GC 보호)
 # ---------------------------------------------------------------------------
 
 _background_tasks: Set[asyncio.Task] = set()
@@ -51,47 +68,71 @@ def _track(task: asyncio.Task) -> None:
     task.add_done_callback(_background_tasks.discard)
 
 
+# ---------------------------------------------------------------------------
+# Policy: user 턴 기준 N회마다
+# ---------------------------------------------------------------------------
+
+def _user_turn_count(session: Session) -> int:
+    """recent_messages 안의 user role 메시지 수."""
+    return sum(
+        1 for m in session.conversation.recent_messages if m.role.value == "user"
+    )
+
+
+def _should_update_memory(session: Session) -> tuple[bool, str]:
+    every_n = max(1, settings.MEMORY_UPDATE_EVERY_N_TURNS)
+    user_turns = _user_turn_count(session)
+    if user_turns > 0 and user_turns % every_n == 0:
+        return True, f"every_{every_n}_turns(user_turn={user_turns})"
+    return False, f"skip(user_turn={user_turns}, every={every_n})"
+
+
+# ---------------------------------------------------------------------------
+# Memory update work
+# ---------------------------------------------------------------------------
+
 async def _run_memory_update(session_id: str) -> None:
     """
-    memory_state_generator를 1회 호출해서 narrative + structured를 갱신.
-    세션을 다시 로드 → 갱신 → save.
+    직전 N턴 내용 + 기존 summary로 memory_state_generator 호출.
+    세션별 lock으로 같은 세션 동시 갱신 방지.
     """
-    try:
-        from app.services.memory.memory_state_generator import update_memory_state
-        logger.info("[MEMORY_DEBUG] imported update_memory_state=%r", update_memory_state)
+    lock = _lock_for(session_id)
+    async with lock:
+        try:
+            from app.services.memory.memory_state_generator import update_memory_state
 
-        session = await get_or_create(session_id)
-        logger.info(
-            "[MEMORY_UPDATE] finalize_start | recent_messages=%d summary_narrative_len=%d facts=%d",
-            len(session.conversation.recent_messages),
-            len(session.conversation.summary.narrative or ""),
-            len(session.conversation.summary.structured.established_facts or []),
-        )
+            session = await get_or_create(session_id)
+            logger.info(
+                "[MEMORY_UPDATE] start | sid=%s recent=%d prev_narrative_len=%d prev_facts=%d",
+                session_id,
+                len(session.conversation.recent_messages),
+                len(session.conversation.summary.narrative or ""),
+                len(session.conversation.summary.structured.established_facts or []),
+            )
 
-        await update_memory_state(session)
+            await update_memory_state(session)
 
-        logger.info(
-            "[MEMORY_UPDATE] finalize_done | summary=%s",
-            json.dumps(
-                {
-                    "narrative": session.conversation.summary.narrative,
-                    "structured": {
-                        "goal": session.conversation.summary.structured.goal,
-                        "established_facts": session.conversation.summary.structured.established_facts,
-                        "current_focus": session.conversation.summary.structured.current_focus,
-                        "unresolved_questions": session.conversation.summary.structured.unresolved_questions,
+            logger.info(
+                "[MEMORY_UPDATE] done  | sid=%s summary=%s",
+                session_id,
+                json.dumps(
+                    {
+                        "narrative": session.conversation.summary.narrative,
+                        "structured": {
+                            "goal": session.conversation.summary.structured.goal,
+                            "established_facts": session.conversation.summary.structured.established_facts,
+                            "current_focus": session.conversation.summary.structured.current_focus,
+                            "unresolved_questions": session.conversation.summary.structured.unresolved_questions,
+                        },
                     },
-                },
-                ensure_ascii=False,
-            ),
-        )
-
-        await save_session(session)
-        logger.debug("memory refresh done: session=%s", session_id)
-    except Exception as e:
-        logger.exception(
-            "memory refresh failed: session=%s err=%s", session_id, e
-        )
+                    ensure_ascii=False,
+                )[:600],
+            )
+            await save_session(session)
+        except Exception as e:
+            logger.exception(
+                "memory refresh failed: session=%s err=%s", session_id, e
+            )
 
 
 # ---------------------------------------------------------------------------
@@ -99,42 +140,56 @@ async def _run_memory_update(session_id: str) -> None:
 # ---------------------------------------------------------------------------
 
 async def finalize(
-    session: Session, assistant_text: str
+    session: Session,
+    assistant_text: str,
+    **_ignored,  # 하위호환 (pipeline에서 user_text / pdf_just_attached 주던 거 무시)
 ) -> Tuple[bool, Optional[str]]:
     """
-    LLM 호출 직후의 마무리 단계.
+    매 턴 호출. assistant append + save + (조건부) memory update task 스케줄.
 
     Returns:
         (expired, expire_reason)
     """
-    # 1) assistant 턴 append
+    # 1) assistant append + 저장 (이건 매 턴 항상)
     append_message(session, Role.ASSISTANT, assistant_text)
+    await save_session(session)
 
-    # 2) memory 갱신 — 기본은 await, 설정으로 fire-and-forget 가능
-    memory_async = getattr(settings, "MEMORY_UPDATE_ASYNC", False)
+    # 2) 3턴 정책 판정
+    should_update, reason = _should_update_memory(session)
+    logger.info(
+        "[MEMORY_POLICY] sid=%s should_update=%s reason=%s",
+        session.session_meta.session_id,
+        should_update,
+        reason,
+    )
 
-    if memory_async:
-        # 운영 FastAPI: fire-and-forget (이벤트 루프가 계속 돌아서 괜찮음)
-        await save_session(session)
+    # 3) 업데이트 필요하면 fire-and-forget으로 스케줄 (Colab/FastAPI 동일)
+    if should_update:
         try:
             loop = asyncio.get_running_loop()
             bg_task = loop.create_task(
                 _run_memory_update(session.session_meta.session_id)
             )
             _track(bg_task)
-        except RuntimeError:
-            logger.debug("no running loop; skipping background memory refresh")
-    else:
-        # Colab / 테스트: await해서 메모리가 확실히 채워진 뒤 반환
-        await save_session(session)
-        await _run_memory_update(session.session_meta.session_id)
-        # _run_memory_update가 내부에서 save_session을 또 부르므로
-        # session 객체를 다시 로드하지 않아도 저장은 된 상태임.
+            logger.info(
+                "[MEMORY_POLICY] sid=%s scheduled background task (id=%s)",
+                session.session_meta.session_id,
+                id(bg_task),
+            )
+        except RuntimeError as e:
+            # 이벤트 루프가 살아있지 않은 환경 (예: Colab에서 영구 루프 헬퍼를 안 썼을 때).
+            # 메모리 업데이트는 skip되지만 답변은 정상 반환됨.
+            logger.warning(
+                "[MEMORY_POLICY] cannot schedule background task: %s. "
+                "Colab이면 notebooks의 영구 이벤트 루프 헬퍼를 사용하세요.",
+                e,
+            )
 
-    # 3) 메모리 캡 체크 (최신 세션 기준)
+    # 4) 메모리 캡 체크
     session = await get_or_create(session.session_meta.session_id)
     if is_over_limit(session):
         await purge_session(session.session_meta.session_id, reason="memory_limit")
+        _session_locks.pop(session.session_meta.session_id, None)
         return True, "memory_limit"
 
     return False, None

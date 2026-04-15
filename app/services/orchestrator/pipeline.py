@@ -3,25 +3,20 @@ app/services/orchestrator/pipeline.py
 -------------------------------------
 역할: 전체 흐름을 담당하는 핵심 파이프라인.
 
-v8 변경 (이번 패치):
-1) build_prompt() 시그니처 변경에 따른 호출부 수정:
-   prev: prompt = build_prompt(...)
-   now : system_prompt, user_prompt = build_prompt(...)
-   → LLMClient.generate(prompt=user_prompt, system=system_prompt) 분리 호출.
-   → LocalModelRegistry가 chat template의 system role로 system_prompt를 주입한다.
-   → Qwen 한국어 일관성 / instruction-following 안정화의 핵심.
+v11 변경:
+1) finalize() 호출 시 user_text와 pdf_just_attached를 함께 넘겨서,
+   정책 기반 memory update 판정(3턴마다 + 예외 즉시 갱신)이 가능하도록 함.
+   - pdf_just_attached: 이번 턴에서 새 PDF가 세션에 연결됐는지 추적.
+   - user_text: "내 이름은..." 같은 안정 정보 트리거 판정에 사용.
 
-2) 파이프라인 끝에 있던 update_memory_state() 직접 호출 블록 제거.
-   → memory 갱신은 response_finalizer가 background fire-and-forget으로 처리.
-   → FINALIZE 단계가 21~50초씩 걸리던 문제 해결.
+2) LLMClient.generate() 호출 시 max_new_tokens를 settings.ANSWER_MAX_NEW_TOKENS
+   (기본 200)로 명시 전달. 이전엔 registry 등록값(300~512)이 그대로 먹혔는데,
+   명시적으로 상한을 짧게 걸어 latency 단축 + 언어 전환 차단.
 
-3) 라우터 결정 로깅 메시지 명확화 (NEED_RAG → DIRECT_ANSWER 경로의 이유 노출).
-   실제 매핑 로직 자체는 router_judge가 담당.
-
-기존 설계 포인트는 유지:
-- PDF 업로드가 있는 턴에서는 무거운 문서 전처리를 background ingest task로 시작.
-- memory/router 판정은 그와 병렬로 먼저 수행.
-- 라우터가 RAG 필요로 판단한 경우에만 ingest 완료까지 기다린다.
+v8 설계 유지:
+- build_prompt() → (system, user) 튜플 분리
+- LLMClient.generate(system=..., prompt=...)로 chat template 분리 주입
+- PDF ingest는 background로 시작, 라우터가 RAG 필요로 판단한 경우에만 대기
 """
 from __future__ import annotations
 
@@ -30,6 +25,7 @@ from typing import List
 
 from app.schemas.request import ChatRequest
 from app.schemas.response import ChatResponse
+from app.core.config import settings
 from app.core.constants import Role, AnswerType, ModelKind, RouterDecision
 from app.core.logger import (
     get_logger,
@@ -78,6 +74,7 @@ async def run(req: ChatRequest) -> ChatResponse:
     log_memory(logger, session, "after_session_load")
 
     # 2) optional PDF attach + background ingest start -------------------------
+    pdf_just_attached = False  # v11: finalize 정책 판정용
     ingest_task = None
     if req.file_path and req.file_name:
         t2 = log_stage_start(
@@ -113,6 +110,7 @@ async def run(req: ChatRequest) -> ChatResponse:
                 num_bytes=len(data),
             )
             await attach_pdf_to_session(session, req.file_name, data)
+            pdf_just_attached = True  # v11
             log_state(logger, "pdf_attached", file_name=req.file_name)
 
         ingest_task = await ensure_pdf_ingest_started(session)
@@ -121,10 +119,11 @@ async def run(req: ChatRequest) -> ChatResponse:
             "PDF_ATTACH_OR_INGEST",
             t2,
             ingest_task_started=bool(ingest_task),
+            pdf_just_attached=pdf_just_attached,
         )
         log_memory(logger, session, "after_pdf_attach")
 
-    # 3) record current user turn immediately ---------------------------------
+    # 3) record current user turn ---------------------------------------------
     t3 = log_stage_start(logger, "APPEND_USER_MESSAGE", user_text=req.user_text)
     append_message(session, Role.USER, req.user_text)
     log_stage_end(logger, "APPEND_USER_MESSAGE", t3, appended=True)
@@ -234,12 +233,16 @@ async def run(req: ChatRequest) -> ChatResponse:
         model = pick_model(req.image_b64)
         log_state(logger, "model_selected", model=str(model))
 
+        # v11: answer 생성 토큰 상한을 설정에서 가져옴 (기본 200)
+        answer_max_tokens = settings.ANSWER_MAX_NEW_TOKENS
+
         if model == ModelKind.VLM:
             t8 = log_stage_start(logger, "VLM_GENERATE")
             answer = await VLMClient.generate(
                 user_prompt,
                 req.image_b64 or "",
                 system=system_prompt,
+                max_new_tokens=answer_max_tokens,
             )
             answer_type = AnswerType.MULTITURN_WITH_VLM
             log_stage_end(
@@ -251,11 +254,13 @@ async def run(req: ChatRequest) -> ChatResponse:
                 answer_type=str(answer_type),
             )
         else:
-            t9 = log_stage_start(logger, "LLM_GENERATE", role="answer")
+            t9 = log_stage_start(logger, "LLM_GENERATE", role="answer",
+                                 max_new_tokens=answer_max_tokens)
             answer = await LLMClient.generate(
                 user_prompt,
                 role="answer",
                 system=system_prompt,
+                max_new_tokens=answer_max_tokens,
             )
             log_stage_end(
                 logger,
@@ -267,13 +272,17 @@ async def run(req: ChatRequest) -> ChatResponse:
             )
 
     # 6) finalize --------------------------------------------------------------
-    # finalize 안에서 assistant append + save + (background) memory refresh를 모두 처리.
-    # 따라서 v8부터 pipeline.py 끝에 있던 update_memory_state 직접 호출 블록은 삭제됨.
     t10 = log_stage_start(logger, "FINALIZE")
     session.runtime_state.last_answer_type = answer_type
     log_memory(logger, session, "before_finalize")
 
-    expired, reason = await finalize(session, answer)
+    # v11: user_text / pdf_just_attached를 전달하여 memory update 정책을 적용
+    expired, reason = await finalize(
+        session,
+        answer,
+        user_text=req.user_text,
+        pdf_just_attached=pdf_just_attached,
+    )
 
     log_stage_end(
         logger,
