@@ -203,10 +203,16 @@ async def update_memory_state(session: Session) -> None:
     if role is None:
         return  # 등록 없음 → graceful no-op
 
+    logger.info("[MEMORY_UPDATE] update_memory_state_enter")
+
     conversation_text = _build_memory_input(session)
     if not conversation_text:
         return
-
+    logger.info(
+    "[MEMORY_UPDATE] memory_input_built | chars=%d preview=%s",
+    len(conversation_text),
+    conversation_text[:500].replace("\n", "\\n"),
+)
     # user 메시지 본문 — system은 LocalModelRegistry가 chat template에 분리 주입
     user_prompt = f"Conversation:\n{conversation_text}"
 
@@ -220,6 +226,10 @@ async def update_memory_state(session: Session) -> None:
         )
         parsed = _parse_memory_state(raw)
         if parsed:
+            logger.info(
+                "[MEMORY_UPDATE] apply_start | parsed=%s",
+                json.dumps(parsed, ensure_ascii=False),
+            )
             _apply_to_session(session, parsed)
             logger.info(
                 "memory_state updated via role=%s: topic=%r facts=%d unresolved=%d",
@@ -227,6 +237,14 @@ async def update_memory_state(session: Session) -> None:
                 (parsed.get("memory_state") or {}).get("topic", ""),
                 len((parsed.get("memory_state") or {}).get("key_facts") or []),
                 len((parsed.get("memory_state") or {}).get("unresolved_refs") or []),
+            )
+            # apply 이후
+            logger.info(
+                "[MEMORY_UPDATE] apply_done | narrative=%s facts=%s focus=%s unresolved=%s",
+                session.conversation.summary.narrative,
+                session.conversation.summary.structured.established_facts,
+                session.conversation.summary.structured.current_focus,
+                session.conversation.summary.structured.unresolved_questions,
             )
         else:
             logger.warning(
