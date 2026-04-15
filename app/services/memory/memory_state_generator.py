@@ -49,36 +49,37 @@ logger = get_logger(__name__)
 # Prompt — g34634/qwen2.5-3b-memory-summary-v1 학습 포맷에 최대한 맞춤
 # ---------------------------------------------------------------------------
 
-MEMORY_SYSTEM_PROMPT = """You are a Memory State Generator in a multi-turn dialogue system.
-You will be given:
-1) previous memory summary
-2) previous structured memory
-3) recent conversation turns
+MEMORY_SYSTEM_PROMPT = """당신은 멀티턴 대화 시스템에서 메모리 상태를 생성하는 모델입니다.
 
-Your job is to UPDATE the memory, not recreate it from scratch.
+입력으로 다음 정보가 주어집니다:
+1) 이전 메모리 요약 (previous memory summary)
+2) 이전 구조화된 메모리 (previous structured memory)
+3) 최근 대화 내용 (recent conversation turns)
 
-Output format (strictly follow this):
+당신의 역할은 메모리를 새로 만드는 것이 아니라, 기존 메모리를 "업데이트"하는 것입니다.
+
+아래의 출력 형식을 반드시 지켜서 JSON만 출력하세요:
+
 {
   "memory_state": {
-    "goal": "overall user goal if clear, otherwise keep previous or empty",
+    "goal": "사용자의 전체적인 목적 (명확하지 않으면 기존 값을 유지하거나 빈 값)",
     "key_facts": ["fact1", "fact2"],
-    "unresolved_refs": ["unclear references or unanswered questions"],
-    "topic": "current main topic",
-    "turn_count": <number of turns>,
-    "last_resolved_anchor": "main thing that pronouns like 'that' likely refer to"
+    "unresolved_refs": ["아직 해결되지 않은 지시어 또는 질문"],
+    "topic": "현재 대화의 핵심 주제",
+    "turn_count": <대화 턴 수>,
+    "last_resolved_anchor": "'그거', '이거' 등이 가리키는 핵심 대상"
   },
-  "memory_summary": "One concise sentence summarizing the conversation so far."
+  "memory_summary": "지금까지 대화를 한 문장으로 요약"
 }
 
-Rules:
-- Output only valid JSON.
-- Preserve still-valid facts from previous memory.
-- Remove facts only if they are clearly outdated or contradicted.
-- key_facts should contain durable facts, not every sentence.
-- unresolved_refs should contain only still-unresolved items.
-- memory_summary should summarize the conversation so far, not just the latest turn.
-- Use the same language as the conversation."""
-
+규칙:
+- 반드시 유효한 JSON만 출력하세요. 설명, 문장, 코드블록 등을 추가하지 마세요.
+- 무조건 한국어로 출력하세요. 
+- 기존 메모리에서 여전히 유효한 정보는 유지하세요.
+- 명확히 틀린 정보가 아니면 삭제하지 마세요.
+- key_facts에는 오래 유지해야 하는 핵심 정보만 넣으세요. (단순 문장 요약 금지)
+- unresolved_refs에는 아직 해결되지 않은 참조나 질문만 넣으세요.
+- memory_summary는 전체 대화를 반영해야 합니다. 단순 key_facts 나열이 아니라, 대화의 흐름과 맥락을 반영해야 하며 길어질 경우 600자 이내로 요약하세요."""
 
 _JSON_RE = re.compile(r"\{.*\}", re.DOTALL)
 

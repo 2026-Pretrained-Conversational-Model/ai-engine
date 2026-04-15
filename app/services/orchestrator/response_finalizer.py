@@ -58,6 +58,7 @@ async def _run_memory_update(session_id: str) -> None:
     """
     try:
         from app.services.memory.memory_state_generator import update_memory_state
+        logger.info("[MEMORY_DEBUG] imported update_memory_state=%r", update_memory_state)
 
         session = await get_or_create(session_id)
         logger.info(
