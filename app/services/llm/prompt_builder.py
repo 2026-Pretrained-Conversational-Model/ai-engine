@@ -27,7 +27,8 @@ from app.services.conversation.recent_window import get_recent, render_for_promp
 
 
 SYSTEM_INSTRUCTION = (
-    "You are a helpful assistant. Always interpret the user's question on top "
+    "You are a helpful assistant. Always respond in the same language as the user's question. "
+    "Always interpret the user's question on top "
     "of the multi-turn conversation context. If PDF context is provided, use "
     "it as supporting evidence; otherwise rely on the conversation alone. "
     "If the evidence is insufficient, say what is missing instead of pretending."
