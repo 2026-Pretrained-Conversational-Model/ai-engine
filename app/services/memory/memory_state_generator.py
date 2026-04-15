@@ -3,10 +3,16 @@ app/services/memory/memory_state_generator.py
 ----------------------------------------------
 역할: 3턴 단위로 summary(narrative + structured)를 재생성한다.
 
-v12 설계 — 입력 구성:
+[]
     기존 summary(narrative + structured)  +
     직전 N턴 전체 대화 (user + assistant 쌍)
     → Memory LLM이 이 둘을 보고 summary 업데이트
+=======
+역할: 매 턴 종료 후 대화 내용을 읽고 memory_state JSON을 생성하여
+      세션의 conversation.summary에 반영한다.
+
+파이프라인에서의 위치:
+    사용자 입력 → Router → LLM/VLM → [Memory State Generator] → 세션 저장
 
     N은 settings.MEMORY_UPDATE_WINDOW_TURNS (기본 3).
     user 턴 기준 3이면 user 3개 + assistant 3개 = 6개 메시지를 뽑음.
@@ -147,6 +153,45 @@ def _build_memory_input(session: Session) -> str:
     lines.append("")
 
     lines.append("위 정보를 바탕으로 memory_state JSON을 출력하세요.")
+# def _generate_with_system(role: str, system: str, user: str, max_tokens: int) -> str:
+#     """system + user 메시지를 chat template으로 구성해서 모델 호출"""
+#     from app.services.llm.local_registry import LocalModelRegistry
+#     import torch
+
+#     entry = LocalModelRegistry.get(role)
+#     tok = entry.tokenizer
+#     model = entry.model
+
+#     messages = [
+#         {"role": "system", "content": system},
+#         {"role": "user", "content": user},
+#     ]
+
+#     input_ids = tok.apply_chat_template(
+#         messages, add_generation_prompt=True, return_tensors="pt"
+#     ).to(entry.device)
+
+#     with torch.no_grad():
+#         out = model.generate(
+#             input_ids=input_ids,
+#             max_new_tokens=max_tokens,
+#             do_sample=False,
+#             pad_token_id=tok.eos_token_id,
+#         )
+
+#     new_tokens = out[0, input_ids.shape[1]:]
+#     return tok.decode(new_tokens, skip_special_tokens=True).strip()
+
+
+# def _build_conversation_text(session: Session) -> str:
+#     """recent_messages를 대화 텍스트로 변환"""
+#     messages = session.conversation.recent_messages
+#     if not messages:
+#         return ""
+#     lines = []
+#     for m in messages:
+#         role = "A" if m.role.value == "user" else "B"
+#         lines.append(f"{role}: {m.text}")
     return "\n".join(lines)
 
 
@@ -178,6 +223,12 @@ def _apply_to_session(session: Session, parsed: dict) -> None:
     key_facts = [str(f).strip()[:200] for f in key_facts_raw if str(f).strip()][:8]
     unresolved = [str(r).strip()[:200] for r in unresolved_raw if str(r).strip()][:5]
     topic = str(topic_raw).strip()[:200]
+#     if memory_summary:
+#         session.conversation.summary.narrative = memory_summary[:800]
+
+#     key_facts  = memory_state.get("key_facts", [])
+#     unresolved = memory_state.get("unresolved_refs", [])
+#     topic      = memory_state.get("topic", "")
 
     session.conversation.summary.structured = StructuredSummary(
         goal=goal,
@@ -224,6 +275,13 @@ async def update_memory_state(session: Session) -> None:
             user_prompt,
             300,                      # memory 출력 JSON 최대 토큰
             MEMORY_SYSTEM_PROMPT,
+#     try:
+#         raw = await asyncio.to_thread(
+#             _generate_with_system,
+#             "memory",
+#             SYSTEM_PROMPT,
+#             f"Conversation:\n{conversation_text}",
+#             256,
         )
         parsed = _parse_memory_state(raw)
         if parsed:
@@ -240,3 +298,4 @@ async def update_memory_state(session: Session) -> None:
             )
     except Exception as e:
         logger.exception("[MEMORY_GEN] failed: %s", e)
+

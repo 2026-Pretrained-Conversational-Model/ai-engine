@@ -90,22 +90,44 @@ def _map_to_router_decision(
         if has_doc:
             rq = (rag_response.retrieval_query or "").lower()
             if any(hint in rq for hint in _REFERENCE_HINTS):
-                return (
-                    RouterDecision.SEARCH_PREP_THEN_RETRIEVE,
-                    "need_rag+doc+reference",
-                )
-            return RouterDecision.RETRIEVE_DOC, "need_rag+doc"
-        # 문서 없이 NEED_RAG → 외부 벡터 DB가 없으므로 어쩔 수 없이 강등
-        return (
-            RouterDecision.DIRECT_ANSWER,
-            "downgraded:need_rag_but_no_doc_attached",
-        )
+#                 return (
+#                     RouterDecision.SEARCH_PREP_THEN_RETRIEVE,
+#                     "need_rag+doc+reference",
+#                 )
+#             return RouterDecision.RETRIEVE_DOC, "need_rag+doc"
+#         # 문서 없이 NEED_RAG → 외부 벡터 DB가 없으므로 어쩔 수 없이 강등
+#         return (
+#             RouterDecision.DIRECT_ANSWER,
+#             "downgraded:need_rag_but_no_doc_attached",
+#         )
+
+#     # NO_RAG 분기
+#     if rag_response.reason_code == RagReasonCode.FILE_REQUIRED and has_doc:
+#         return RouterDecision.RETRIEVE_DOC, "no_rag+file_required+doc"
+
+#     return RouterDecision.DIRECT_ANSWER, f"no_rag:{rag_response.reason_code.value}"
+                return RouterDecision.SEARCH_PREP_THEN_RETRIEVE
+            elif any(rag_response.reason_code == RagReasonCode.EXTERNAL_KNOWLEDGE_REQUIRED):
+                return RouterDecision.RETRIEVE_DOC
+            elif any(hint in rq for hint in _DOC_HINTS):
+                return RouterDecision.RETRIEVE_DOC
+            return RouterDecision.RETRIEVE_DOC
+        elif rag_response.reason_code == RagReasonCode.ENOUGH_CONTEXT_IN_QUERY:
+            return RouterDecision.DIRECT_ANSWER
+        # 문서 없이 NEED_RAG → 외부 RAG 미지원, 직접 답변
+        logger.debug("NEED_RAG but no document available, falling back to DIRECT_ANSWER")
+        return RouterDecision.DIRECT_ANSWER
 
     # NO_RAG 분기
     if rag_response.reason_code == RagReasonCode.FILE_REQUIRED and has_doc:
-        return RouterDecision.RETRIEVE_DOC, "no_rag+file_required+doc"
+        return RouterDecision.RETRIEVE_DOC
 
-    return RouterDecision.DIRECT_ANSWER, f"no_rag:{rag_response.reason_code.value}"
+    if rag_response.reason_code == RagReasonCode.AMBIGUOUS_BUT_NOT_RAG:
+        summary_exists = bool(session.pdf_state.doc_summary.one_line)
+        if not session.conversation.recent_messages and not summary_exists:
+            return RouterDecision.DIRECT_ANSWER
+    
+    return RouterDecision.DIRECT_ANSWER
 
 
 # ---------------------------------------------------------------------------
