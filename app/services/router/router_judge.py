@@ -130,15 +130,8 @@ def _map_to_router_decision(
     if rag_response.reason_code == RagReasonCode.AMBIGUOUS_BUT_NOT_RAG:
         summary_exists = bool(session.pdf_state.doc_summary.one_line)
         if not session.conversation.recent_messages and not summary_exists:
-<<<<<<< HEAD
-            return RouterDecision.ASK_CLARIFICATION
-=======
             return RouterDecision.DIRECT_ANSWER
-
-    if rag_response.reason_code == RagReasonCode.ENOUGH_CONTEXT_IN_QUERY:
-        return RouterDecision.ASK_CLARIFICATION
->>>>>>> 89e0739f4460f066daa51bb1b57bf1f6a3d1602d
-        
+    
     return RouterDecision.DIRECT_ANSWER
 
 
