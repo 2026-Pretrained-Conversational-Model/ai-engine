@@ -1,11 +1,11 @@
 """
 app/services/memory/memory_state_generator.py
 ----------------------------------------------
-역할: 매 턴 시작 시 대화 내용을 읽고 memory_state JSON을 생성하여
+역할: 매 턴 종료 후 대화 내용을 읽고 memory_state JSON을 생성하여
       세션의 conversation.summary에 반영한다.
 
 파이프라인에서의 위치:
-    사용자 입력 → [Memory State Generator] → Router → LLM/VLM
+    사용자 입력 → Router → LLM/VLM → [Memory State Generator] → 세션 저장
 
 LocalModelRegistry에 "memory" role로 등록된 모델을 사용한다.
 등록되어 있지 않으면 graceful no-op으로 동작한다.
@@ -53,6 +53,36 @@ Output only valid JSON. No explanation, no markdown."""
 _JSON_RE = re.compile(r"\{.*\}", re.DOTALL)
 
 
+def _generate_with_system(role: str, system: str, user: str, max_tokens: int) -> str:
+    """system + user 메시지를 chat template으로 구성해서 모델 호출"""
+    from app.services.llm.local_registry import LocalModelRegistry
+    import torch
+
+    entry = LocalModelRegistry.get(role)
+    tok = entry.tokenizer
+    model = entry.model
+
+    messages = [
+        {"role": "system", "content": system},
+        {"role": "user", "content": user},
+    ]
+
+    input_ids = tok.apply_chat_template(
+        messages, add_generation_prompt=True, return_tensors="pt"
+    ).to(entry.device)
+
+    with torch.no_grad():
+        out = model.generate(
+            input_ids=input_ids,
+            max_new_tokens=max_tokens,
+            do_sample=False,
+            pad_token_id=tok.eos_token_id,
+        )
+
+    new_tokens = out[0, input_ids.shape[1]:]
+    return tok.decode(new_tokens, skip_special_tokens=True).strip()
+
+
 def _build_conversation_text(session: Session) -> str:
     """recent_messages를 대화 텍스트로 변환"""
     messages = session.conversation.recent_messages
@@ -83,14 +113,12 @@ def _apply_to_session(session: Session, parsed: dict) -> None:
     memory_state = parsed.get("memory_state", {})
     memory_summary = parsed.get("memory_summary", "")
 
-    # narrative summary 업데이트
     if memory_summary:
         session.conversation.summary.narrative = memory_summary[:800]
 
-    # structured summary 업데이트
-    key_facts = memory_state.get("key_facts", [])
+    key_facts  = memory_state.get("key_facts", [])
     unresolved = memory_state.get("unresolved_refs", [])
-    topic = memory_state.get("topic", "")
+    topic      = memory_state.get("topic", "")
 
     session.conversation.summary.structured = StructuredSummary(
         goal=session.conversation.summary.structured.goal,
@@ -99,7 +127,6 @@ def _apply_to_session(session: Session, parsed: dict) -> None:
         unresolved_questions=[str(r)[:200] for r in unresolved[:5]],
     )
 
-    # current_topic도 업데이트
     if topic:
         session.conversation.current_topic = str(topic)[:60]
 
@@ -118,11 +145,13 @@ async def update_memory_state(session: Session) -> None:
     if not conversation_text:
         return
 
-    prompt = f"{SYSTEM_PROMPT}\n\nConversation:\n{conversation_text}"
-
     try:
         raw = await asyncio.to_thread(
-            LocalModelRegistry.generate, "memory", prompt, 256
+            _generate_with_system,
+            "memory",
+            SYSTEM_PROMPT,
+            f"Conversation:\n{conversation_text}",
+            256,
         )
         parsed = _parse_memory_state(raw)
         if parsed:
@@ -133,6 +162,8 @@ async def update_memory_state(session: Session) -> None:
                 len(parsed.get("memory_state", {}).get("key_facts", [])),
             )
         else:
-            logger.warning("memory_state_generator: unparseable output: %r", (raw or "")[:120])
+            logger.warning(
+                "memory_state_generator: unparseable output: %r", (raw or "")[:120]
+            )
     except Exception as e:
         logger.exception("memory_state_generator failed: %s", e)
