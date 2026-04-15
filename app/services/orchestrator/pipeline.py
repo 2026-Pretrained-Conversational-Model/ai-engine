@@ -3,24 +3,25 @@ app/services/orchestrator/pipeline.py
 -------------------------------------
 역할: 전체 흐름을 담당하는 핵심 파이프라인.
 
-변경점:
-- judge_route()가 async 함수로 바뀜에 따라,
-  router_task 생성 시 asyncio.to_thread 래핑을 제거하고
-  직접 judge_route 코루틴을 create_task로 스케줄링한다.
-  (resolve/intent/topic은 여전히 동기 함수라 to_thread 유지.)
+v8 변경 (이번 패치):
+1) build_prompt() 시그니처 변경에 따른 호출부 수정:
+   prev: prompt = build_prompt(...)
+   now : system_prompt, user_prompt = build_prompt(...)
+   → LLMClient.generate(prompt=user_prompt, system=system_prompt) 분리 호출.
+   → LocalModelRegistry가 chat template의 system role로 system_prompt를 주입한다.
+   → Qwen 한국어 일관성 / instruction-following 안정화의 핵심.
+
+2) 파이프라인 끝에 있던 update_memory_state() 직접 호출 블록 제거.
+   → memory 갱신은 response_finalizer가 background fire-and-forget으로 처리.
+   → FINALIZE 단계가 21~50초씩 걸리던 문제 해결.
+
+3) 라우터 결정 로깅 메시지 명확화 (NEED_RAG → DIRECT_ANSWER 경로의 이유 노출).
+   실제 매핑 로직 자체는 router_judge가 담당.
 
 기존 설계 포인트는 유지:
-1. PDF 업로드가 있는 턴에서는 무거운 문서 전처리를 background ingest task로 시작.
-2. 동시에 user message append / resolve / intent / topic / router 판정을 먼저 수행.
-3. 라우터가 RAG 또는 document summary가 필요한 경로를 선택한 경우에만
-   ingest task 완료까지 기다린다.
-4. Memory State Generator만 학습 모듈로 가정하고,
-   나머지(router / search prep / retriever / answer)는 비학습 baseline으로 유지.
-
-변경점:
-- judge_route()가 async 함수이므로 직접 create_task로 스케줄링
-- turn / stage / memory 로그 추가
-- 각 레이어 결과값을 추적 가능하게 로깅 강화
+- PDF 업로드가 있는 턴에서는 무거운 문서 전처리를 background ingest task로 시작.
+- memory/router 판정은 그와 병렬로 먼저 수행.
+- 라우터가 RAG 필요로 판단한 경우에만 ingest 완료까지 기다린다.
 """
 from __future__ import annotations
 
@@ -55,7 +56,6 @@ from app.services.pdf.pdf_ingest import (
 )
 from app.services.pdf.pdf_retriever import retrieve_relevant
 from app.services.router.router_judge import judge_route
-from app.services.memory.memory_state_generator import update_memory_state
 
 logger = get_logger(__name__)
 
@@ -74,7 +74,7 @@ async def run(req: ChatRequest) -> ChatResponse:
     # 1) session load ----------------------------------------------------------
     t1 = log_stage_start(logger, "SESSION_LOAD", session_id=req.session_id)
     session = await get_or_create(req.session_id)
-    log_stage_end(logger, "SESSION_LOAD",t1, session_id=req.session_id)
+    log_stage_end(logger, "SESSION_LOAD", t1, session_id=req.session_id)
     log_memory(logger, session, "after_session_load")
 
     # 2) optional PDF attach + background ingest start -------------------------
@@ -127,7 +127,7 @@ async def run(req: ChatRequest) -> ChatResponse:
     # 3) record current user turn immediately ---------------------------------
     t3 = log_stage_start(logger, "APPEND_USER_MESSAGE", user_text=req.user_text)
     append_message(session, Role.USER, req.user_text)
-    log_stage_end(logger, "APPEND_USER_MESSAGE",t3, appended=True)
+    log_stage_end(logger, "APPEND_USER_MESSAGE", t3, appended=True)
     log_memory(logger, session, "after_user_append")
 
     # 4) memory-side lightweight updates + router judge in parallel ------------
@@ -140,7 +140,7 @@ async def run(req: ChatRequest) -> ChatResponse:
     has_attachment = bool(session.pdf_state.active_pdf)
     router_task = asyncio.create_task(
         judge_route(session, req.user_text, has_attachment)
-    ) ## [진주용] : 시작부분
+    )
 
     resolved = await resolved_task
     intent_result = await intent_task
@@ -219,14 +219,16 @@ async def run(req: ChatRequest) -> ChatResponse:
                 chunk_count=len(pdf_chunks),
             )
 
+        # ---- Prompt build (system + user 분리) ------------------------------
         t7 = log_stage_start(logger, "PROMPT_BUILD")
-        prompt = build_prompt(session, resolved, pdf_chunks)
+        system_prompt, user_prompt = build_prompt(session, resolved, pdf_chunks)
         log_stage_end(
             logger,
             "PROMPT_BUILD",
             t7,
-            prompt_length=len(prompt),
-            prompt_preview=prompt[:300],
+            system_length=len(system_prompt),
+            user_length=len(user_prompt),
+            user_preview=user_prompt[:300],
         )
 
         model = pick_model(req.image_b64)
@@ -234,7 +236,11 @@ async def run(req: ChatRequest) -> ChatResponse:
 
         if model == ModelKind.VLM:
             t8 = log_stage_start(logger, "VLM_GENERATE")
-            answer = await VLMClient.generate(prompt, req.image_b64 or "")
+            answer = await VLMClient.generate(
+                user_prompt,
+                req.image_b64 or "",
+                system=system_prompt,
+            )
             answer_type = AnswerType.MULTITURN_WITH_VLM
             log_stage_end(
                 logger,
@@ -246,7 +252,11 @@ async def run(req: ChatRequest) -> ChatResponse:
             )
         else:
             t9 = log_stage_start(logger, "LLM_GENERATE", role="answer")
-            answer = await LLMClient.generate(prompt, role="answer")
+            answer = await LLMClient.generate(
+                user_prompt,
+                role="answer",
+                system=system_prompt,
+            )
             log_stage_end(
                 logger,
                 "LLM_GENERATE",
@@ -257,6 +267,8 @@ async def run(req: ChatRequest) -> ChatResponse:
             )
 
     # 6) finalize --------------------------------------------------------------
+    # finalize 안에서 assistant append + save + (background) memory refresh를 모두 처리.
+    # 따라서 v8부터 pipeline.py 끝에 있던 update_memory_state 직접 호출 블록은 삭제됨.
     t10 = log_stage_start(logger, "FINALIZE")
     session.runtime_state.last_answer_type = answer_type
     log_memory(logger, session, "before_finalize")
@@ -272,21 +284,6 @@ async def run(req: ChatRequest) -> ChatResponse:
         answer_type=str(answer_type),
     )
     log_memory(logger, session, "after_finalize")
-
-    # 7) Memory State Generator -----------------------------------------------
-    if not expired:
-        log_stage_start(logger, "MEMORY_STATE_GENERATOR")
-        session = await get_or_create(req.session_id)
-        await update_memory_state(session)
-        from app.services.session.session_updater import save_session
-        await save_session(session)
-        log_stage_end(
-            logger,
-            "MEMORY_STATE_GENERATOR",
-            narrative_length=len(session.conversation.summary.narrative),
-            topic=session.conversation.current_topic,
-        )
-        log_memory(logger, session, "after_memory_state_generator")
 
     response = ChatResponse(
         session_id=req.session_id,

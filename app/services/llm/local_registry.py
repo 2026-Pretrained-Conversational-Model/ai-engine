@@ -6,28 +6,20 @@ app/services/llm/local_registry.py
 지원 role:
     - "answer":  최종 답변 생성 LLM
     - "router":  RouterDecision 분류용 LLM (소형 권장)
-    - "summary": narrative/structured summary 갱신용 LLM
+    - "summary" / "memory": Memory State Generator용 LLM
     - "vlm":     (선택) 이미지+텍스트 VLM
 
-노트북에서 사용 예:
-    from transformers import AutoModelForCausalLM, AutoTokenizer
-    tok = AutoTokenizer.from_pretrained("Qwen/Qwen2.5-7B-Instruct")
-    model = AutoModelForCausalLM.from_pretrained("Qwen/Qwen2.5-7B-Instruct",
-                                                  device_map="auto", torch_dtype="auto")
+이번 패치 핵심 변경 (v8):
+    1) generate()가 system 파라미터를 받는다. chat template에 system role로 주입.
+       이전엔 user 메시지 하나만 넣어서 Qwen이 한국어 instruction-following을 자주 깨뜨렸음.
+    2) 등록 시 default_system 문자열을 같이 등록할 수 있다. 호출부에서 system을 안 주면 default 사용.
+    3) generate_kwargs를 role별로 분리할 수 있게 그대로 유지. (answer는 약간 sampling, router/summary는 greedy)
 
-    from app.services.llm.local_registry import LocalModelRegistry
-    LocalModelRegistry.register("answer", model, tok, device="cuda")
+호출자(local_backend.py, narrative/memory updater, router_judge)는
+이 함수에 system을 명시적으로 전달하도록 함께 패치됨.
+"""
+from __future__ import annotations
 
-중요:
-- 모델은 노트북 셀 1회 로드 → 모든 pipeline.run() 호출이 재사용한다.
-- pipeline은 비동기지만 model.generate()는 동기이므로,
-  호출부(local_backend.py)가 asyncio.to_thread로 감싸서 이벤트 루프를 블로킹하지 않는다.
-"""
-"""
-app/services/llm/local_registry.py
-----------------------------------
-역할: Colab/로컬에서 로드한 HuggingFace 모델을 프로세스 전역에 등록하는 싱글톤.
-"""
 from dataclasses import dataclass, field
 from typing import Any, Dict, Optional
 
@@ -42,6 +34,7 @@ class ModelEntry:
     tokenizer: Any
     device: str = "cuda"
     max_new_tokens: int = 512
+    default_system: str = ""
     generate_kwargs: Dict[str, Any] = field(default_factory=dict)
 
 
@@ -49,6 +42,8 @@ class LocalModelRegistry:
     """role 문자열 → ModelEntry 매핑 싱글톤."""
 
     _entries: Dict[str, ModelEntry] = {}
+
+    # ---- 등록 / 조회 ---------------------------------------------------------
 
     @classmethod
     def register(
@@ -58,6 +53,7 @@ class LocalModelRegistry:
         tokenizer: Any,
         device: str = "cuda",
         max_new_tokens: int = 512,
+        default_system: str = "",
         generate_kwargs: Optional[Dict[str, Any]] = None,
     ) -> None:
         cls._entries[role] = ModelEntry(
@@ -65,9 +61,13 @@ class LocalModelRegistry:
             tokenizer=tokenizer,
             device=device,
             max_new_tokens=max_new_tokens,
+            default_system=default_system,
             generate_kwargs=generate_kwargs or {},
         )
-        logger.info("Registered local model: role=%s device=%s", role, device)
+        logger.info(
+            "Registered local model: role=%s device=%s default_system=%d chars",
+            role, device, len(default_system),
+        )
 
     @classmethod
     def has(cls, role: str) -> bool:
@@ -85,12 +85,25 @@ class LocalModelRegistry:
     def list_roles(cls) -> list[str]:
         return list(cls._entries.keys())
 
+    # ---- 실제 generate 호출 --------------------------------------------------
+
     @classmethod
-    def generate(cls, role: str, prompt: str, max_new_tokens: Optional[int] = None) -> str:
+    def generate(
+        cls,
+        role: str,
+        prompt: str,
+        max_new_tokens: Optional[int] = None,
+        system: Optional[str] = None,
+    ) -> str:
         """
         동기 generation. asyncio.to_thread에서 호출될 것을 가정함.
-        chat template이 있으면 사용, 없으면 raw encode.
-        입력 이후 새로 생성된 토큰만 디코딩해서 반환.
+
+        - system: chat template에 system role로 주입할 문자열.
+                  None이면 등록 시 지정한 default_system 사용.
+                  빈 문자열이면 system 메시지 생략.
+        - chat template이 있으면 messages=[system, user]로 빌드.
+          없으면 raw text 인코딩(이 경우 system은 prompt 앞에 prepend).
+        - 입력 이후 새로 생성된 토큰만 디코딩해서 반환.
         """
         entry = cls._entries.get(role)
         if entry is None:
@@ -102,6 +115,8 @@ class LocalModelRegistry:
         model = entry.model
         device = entry.device
 
+        effective_system = system if system is not None else entry.default_system
+
         gen_kwargs: Dict[str, Any] = dict(entry.generate_kwargs)
         gen_kwargs.setdefault("max_new_tokens", max_new_tokens or entry.max_new_tokens)
         gen_kwargs.setdefault("do_sample", False)
@@ -109,8 +124,13 @@ class LocalModelRegistry:
             gen_kwargs.setdefault("pad_token_id", tok.eos_token_id)
 
         if hasattr(tok, "apply_chat_template") and getattr(tok, "chat_template", None):
+            messages: list[dict] = []
+            if effective_system:
+                messages.append({"role": "system", "content": effective_system})
+            messages.append({"role": "user", "content": prompt})
+
             inputs = tok.apply_chat_template(
-                [{"role": "user", "content": prompt}],
+                messages,
                 add_generation_prompt=True,
                 tokenize=True,
                 return_tensors="pt",
@@ -125,8 +145,10 @@ class LocalModelRegistry:
             text = tok.decode(new_tokens, skip_special_tokens=True)
             return text.strip()
 
+        # chat_template 없는 경우: system + user 단순 결합
+        flat = (effective_system + "\n\n" + prompt) if effective_system else prompt
         enc = tok(
-            prompt,
+            flat,
             return_tensors="pt",
             truncation=True,
             max_length=4096,
