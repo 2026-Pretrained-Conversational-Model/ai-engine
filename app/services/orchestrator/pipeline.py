@@ -60,7 +60,7 @@ logger = get_logger(__name__)
 
 
 async def run(req: ChatRequest) -> ChatResponse:
-    log_stage_start(
+    t = log_stage_start(
         logger,
         "TURN",
         session_id=req.session_id,
@@ -71,15 +71,15 @@ async def run(req: ChatRequest) -> ChatResponse:
     )
 
     # 1) session load ----------------------------------------------------------
-    log_stage_start(logger, "SESSION_LOAD", session_id=req.session_id)
+    t1 = log_stage_start(logger, "SESSION_LOAD", session_id=req.session_id)
     session = await get_or_create(req.session_id)
-    log_stage_end(logger, "SESSION_LOAD", session_id=req.session_id)
+    log_stage_end(logger, "SESSION_LOAD",t1, session_id=req.session_id)
     log_memory(logger, session, "after_session_load")
 
     # 2) optional PDF attach + background ingest start -------------------------
     ingest_task = None
     if req.file_path and req.file_name:
-        log_stage_start(
+        t2 = log_stage_start(
             logger,
             "PDF_ATTACH_OR_INGEST",
             session_id=req.session_id,
@@ -118,18 +118,19 @@ async def run(req: ChatRequest) -> ChatResponse:
         log_stage_end(
             logger,
             "PDF_ATTACH_OR_INGEST",
+            t2,
             ingest_task_started=bool(ingest_task),
         )
         log_memory(logger, session, "after_pdf_attach")
 
     # 3) record current user turn immediately ---------------------------------
-    log_stage_start(logger, "APPEND_USER_MESSAGE", user_text=req.user_text)
+    t3 = log_stage_start(logger, "APPEND_USER_MESSAGE", user_text=req.user_text)
     append_message(session, Role.USER, req.user_text)
-    log_stage_end(logger, "APPEND_USER_MESSAGE", appended=True)
+    log_stage_end(logger, "APPEND_USER_MESSAGE",t3, appended=True)
     log_memory(logger, session, "after_user_append")
 
     # 4) memory-side lightweight updates + router judge in parallel ------------
-    log_stage_start(logger, "PARALLEL_MEMORY_AND_ROUTER")
+    t4 = log_stage_start(logger, "PARALLEL_MEMORY_AND_ROUTER")
 
     resolved_task = asyncio.create_task(asyncio.to_thread(resolve, session, req.user_text))
     intent_task = asyncio.create_task(asyncio.to_thread(extract_intent, session, req.user_text))
@@ -154,6 +155,7 @@ async def run(req: ChatRequest) -> ChatResponse:
     log_stage_end(
         logger,
         "PARALLEL_MEMORY_AND_ROUTER",
+        t4,
         resolved=resolved,
         router_decision=str(router_decision),
     )
@@ -164,7 +166,7 @@ async def run(req: ChatRequest) -> ChatResponse:
     answer_type = AnswerType.MULTITURN_ONLY
 
     if router_decision == RouterDecision.ASK_CLARIFICATION:
-        log_stage_start(logger, "ASK_CLARIFICATION_BRANCH")
+        t5 = log_stage_start(logger, "ASK_CLARIFICATION_BRANCH")
         answer = (
             "질문이 어떤 대상을 가리키는지 조금 더 필요해요. "
             "문서/표/그림/이전 대화 중 무엇을 말하는지 한 번만 더 구체적으로 적어주세요."
@@ -172,6 +174,7 @@ async def run(req: ChatRequest) -> ChatResponse:
         log_stage_end(
             logger,
             "ASK_CLARIFICATION_BRANCH",
+            t5,
             answer_preview=answer[:120],
         )
     else:
@@ -179,7 +182,7 @@ async def run(req: ChatRequest) -> ChatResponse:
             RouterDecision.RETRIEVE_DOC,
             RouterDecision.SEARCH_PREP_THEN_RETRIEVE,
         }:
-            log_stage_start(
+            t6 = log_stage_start(
                 logger,
                 "RETRIEVE_BRANCH",
                 router_decision=str(router_decision),
@@ -211,14 +214,16 @@ async def run(req: ChatRequest) -> ChatResponse:
             log_stage_end(
                 logger,
                 "RETRIEVE_BRANCH",
+                t6,
                 chunk_count=len(pdf_chunks),
             )
 
-        log_stage_start(logger, "PROMPT_BUILD")
+        t7 = log_stage_start(logger, "PROMPT_BUILD")
         prompt = build_prompt(session, resolved, pdf_chunks)
         log_stage_end(
             logger,
             "PROMPT_BUILD",
+            t7,
             prompt_length=len(prompt),
             prompt_preview=prompt[:300],
         )
@@ -227,29 +232,31 @@ async def run(req: ChatRequest) -> ChatResponse:
         log_state(logger, "model_selected", model=str(model))
 
         if model == ModelKind.VLM:
-            log_stage_start(logger, "VLM_GENERATE")
+            t8 = log_stage_start(logger, "VLM_GENERATE")
             answer = await VLMClient.generate(prompt, req.image_b64 or "")
             answer_type = AnswerType.MULTITURN_WITH_VLM
             log_stage_end(
                 logger,
                 "VLM_GENERATE",
+                t8,
                 answer_length=len(answer),
                 answer_preview=answer[:200],
                 answer_type=str(answer_type),
             )
         else:
-            log_stage_start(logger, "LLM_GENERATE", role="answer")
+            t9 = log_stage_start(logger, "LLM_GENERATE", role="answer")
             answer = await LLMClient.generate(prompt, role="answer")
             log_stage_end(
                 logger,
                 "LLM_GENERATE",
+                t9,
                 answer_length=len(answer),
                 answer_preview=answer[:200],
                 answer_type=str(answer_type),
             )
 
     # 6) finalize --------------------------------------------------------------
-    log_stage_start(logger, "FINALIZE")
+    t10 = log_stage_start(logger, "FINALIZE")
     session.runtime_state.last_answer_type = answer_type
     log_memory(logger, session, "before_finalize")
 
@@ -258,6 +265,7 @@ async def run(req: ChatRequest) -> ChatResponse:
     log_stage_end(
         logger,
         "FINALIZE",
+        t10,
         expired=expired,
         expire_reason=reason,
         answer_type=str(answer_type),
@@ -275,6 +283,7 @@ async def run(req: ChatRequest) -> ChatResponse:
     log_stage_end(
         logger,
         "TURN",
+        t,
         session_id=req.session_id,
         answer_type=str(answer_type),
         expired=expired,
