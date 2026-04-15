@@ -117,6 +117,8 @@ def _map_to_router_decision(
             elif any(hint in rq for hint in _DOC_HINTS):
                 return RouterDecision.RETRIEVE_DOC
             return RouterDecision.RETRIEVE_DOC
+        elif rag_response.reason_code == RagReasonCode.ENOUGH_CONTEXT_IN_QUERY:
+            return RouterDecision.DIRECT_ANSWER
         # 문서 없이 NEED_RAG → 외부 RAG 미지원, 직접 답변
         logger.debug("NEED_RAG but no document available, falling back to DIRECT_ANSWER")
         return RouterDecision.DIRECT_ANSWER
@@ -129,9 +131,6 @@ def _map_to_router_decision(
         summary_exists = bool(session.pdf_state.doc_summary.one_line)
         if not session.conversation.recent_messages and not summary_exists:
             return RouterDecision.ASK_CLARIFICATION
-
-    if rag_response.reason_code == RagReasonCode.ENOUGH_CONTEXT_IN_QUERY:
-        return RouterDecision.ASK_CLARIFICATION
         
     return RouterDecision.DIRECT_ANSWER
 
