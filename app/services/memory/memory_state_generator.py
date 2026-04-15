@@ -50,26 +50,34 @@ logger = get_logger(__name__)
 # ---------------------------------------------------------------------------
 
 MEMORY_SYSTEM_PROMPT = """You are a Memory State Generator in a multi-turn dialogue system.
-Given a conversation, extract and output a structured memory state as JSON.
+You will be given:
+1) previous memory summary
+2) previous structured memory
+3) recent conversation turns
+
+Your job is to UPDATE the memory, not recreate it from scratch.
 
 Output format (strictly follow this):
 {
   "memory_state": {
+    "goal": "overall user goal if clear, otherwise keep previous or empty",
     "key_facts": ["fact1", "fact2"],
-    "unresolved_refs": ["any unclear references or pronouns"],
-    "topic": "main topic of the conversation",
-    "turn_count": <number of turns>
+    "unresolved_refs": ["unclear references or unanswered questions"],
+    "topic": "current main topic",
+    "turn_count": <number of turns>,
+    "last_resolved_anchor": "main thing that pronouns like 'that' likely refer to"
   },
   "memory_summary": "One concise sentence summarizing the conversation so far."
 }
 
 Rules:
-- Output only valid JSON. No explanation, no markdown fences, no extra text.
-- key_facts must be facts that the USER has stated or that have been agreed upon. Do NOT invent facts.
-- If the user gave their name, profession, preference, etc., put it in key_facts.
-- memory_summary should be in the SAME language as the conversation (Korean if Korean).
-- topic should be a short noun phrase in the conversation's language.
-- Do not write narrative fiction. Only summarize what was actually said."""
+- Output only valid JSON.
+- Preserve still-valid facts from previous memory.
+- Remove facts only if they are clearly outdated or contradicted.
+- key_facts should contain durable facts, not every sentence.
+- unresolved_refs should contain only still-unresolved items.
+- memory_summary should summarize the conversation so far, not just the latest turn.
+- Use the same language as the conversation."""
 
 
 _JSON_RE = re.compile(r"\{.*\}", re.DOTALL)
@@ -79,19 +87,53 @@ _JSON_RE = re.compile(r"\{.*\}", re.DOTALL)
 # Helpers
 # ---------------------------------------------------------------------------
 
-def _build_conversation_text(session: Session) -> str:
-    """recent_messages를 'A:' / 'B:' 형식 대화 텍스트로 변환."""
-    messages = session.conversation.recent_messages
-    if not messages:
-        return ""
-    lines = []
-    for m in messages:
-        speaker = "A" if m.role.value == "user" else "B"
-        # 너무 긴 발화는 자른다 (요약 입력이 폭주하지 않게)
-        text = m.text if len(m.text) <= 600 else (m.text[:600] + "…")
-        lines.append(f"{speaker}: {text}")
-    return "\n".join(lines)
+# def _build_conversation_text(session: Session) -> str:
+#     """recent_messages를 'A:' / 'B:' 형식 대화 텍스트로 변환."""
+#     messages = session.conversation.recent_messages
+#     if not messages:
+#         return ""
+#     lines = []
+#     for m in messages:
+#         speaker = "A" if m.role.value == "user" else "B"
+#         # 너무 긴 발화는 자른다 (요약 입력이 폭주하지 않게)
+#         text = m.text if len(m.text) <= 600 else (m.text[:600] + "…")
+#         lines.append(f"{speaker}: {text}")
+#     return "\n".join(lines)
 
+def _build_memory_input(session: Session) -> str:
+    summary = session.conversation.summary
+    messages = session.conversation.recent_messages
+
+    lines = []
+
+    lines.append("[Previous Memory Summary]")
+    lines.append(summary.narrative or "(none)")
+    lines.append("")
+
+    lines.append("[Previous Structured Memory]")
+    lines.append(f"Goal: {summary.structured.goal or '-'}")
+    lines.append(
+        "Established Facts: "
+        + (", ".join(summary.structured.established_facts) or "-")
+    )
+    lines.append(f"Current Focus: {summary.structured.current_focus or '-'}")
+    lines.append(
+        "Unresolved Questions: "
+        + (", ".join(summary.structured.unresolved_questions) or "-")
+    )
+    lines.append(f"Current Topic: {session.conversation.current_topic or '-'}")
+    lines.append("")
+
+    lines.append("[Recent Conversation]")
+    if messages:
+        for m in messages:
+            speaker = "A" if m.role.value == "user" else "B"
+            text = m.text if len(m.text) <= 600 else (m.text[:600] + "…")
+            lines.append(f"{speaker}: {text}")
+    else:
+        lines.append("(empty)")
+
+    return "\n".join(lines)
 
 def _parse_memory_state(raw: str) -> Optional[dict]:
     if not raw:
@@ -114,37 +156,37 @@ def _resolve_role() -> Optional[str]:
 
 
 def _apply_to_session(session: Session, parsed: dict) -> None:
-    """파싱된 memory_state JSON을 세션에 반영."""
     memory_state = parsed.get("memory_state", {}) or {}
     memory_summary = parsed.get("memory_summary", "") or ""
 
-    # 1) narrative 갱신
     if isinstance(memory_summary, str) and memory_summary.strip():
         session.conversation.summary.narrative = memory_summary.strip()[:800]
 
-    # 2) structured 갱신
+    goal_raw = memory_state.get("goal") or session.conversation.summary.structured.goal or ""
     key_facts_raw = memory_state.get("key_facts") or []
     unresolved_raw = memory_state.get("unresolved_refs") or []
     topic_raw = memory_state.get("topic") or ""
+    anchor_raw = memory_state.get("last_resolved_anchor") or ""
 
+    goal = str(goal_raw).strip()[:200]
     key_facts = [str(f).strip()[:200] for f in key_facts_raw if str(f).strip()][:8]
     unresolved = [str(r).strip()[:200] for r in unresolved_raw if str(r).strip()][:5]
     topic = str(topic_raw).strip()[:200]
+    anchor = str(anchor_raw).strip()[:200]
 
-    # goal은 memory_state_generator가 직접 안 쓰는 필드이므로 기존 값 보존
-    prev_goal = session.conversation.summary.structured.goal
     session.conversation.summary.structured = StructuredSummary(
-        goal=prev_goal,
+        goal=goal,
         established_facts=key_facts,
         current_focus=topic,
         unresolved_questions=unresolved,
     )
 
-    # 3) current_topic 동기화
     if topic:
         session.conversation.current_topic = topic[:60]
 
-
+    if anchor:
+        session.conversation.last_resolved_anchor = anchor
+        session.conversation.last_referenced_item = anchor
 # ---------------------------------------------------------------------------
 # Public entry
 # ---------------------------------------------------------------------------
@@ -161,7 +203,7 @@ async def update_memory_state(session: Session) -> None:
     if role is None:
         return  # 등록 없음 → graceful no-op
 
-    conversation_text = _build_conversation_text(session)
+    conversation_text = _build_memory_input(session)
     if not conversation_text:
         return
 
