@@ -86,51 +86,61 @@ class LocalModelRegistry:
 
     # ---- 실제 generate 호출 --------------------------------------------------
 
-    @classmethod
-    def generate(cls, role: str, prompt: str, max_new_tokens: Optional[int] = None) -> str:
-        """
-        동기 generation. asyncio.to_thread에서 호출될 것을 가정함.
+@classmethod
+def generate(cls, role: str, prompt: str, max_new_tokens: Optional[int] = None) -> str:
+    entry = cls._entries.get(role)
+    if entry is None:
+        raise RuntimeError(f"LocalModelRegistry: role='{role}' is not registered")
 
-        chat template이 있으면 사용, 없으면 raw encode.
-        입력 이후 새로 생성된 토큰만 디코딩해서 반환.
-        """
-        entry = cls._entries.get(role)
-        if entry is None:
-            raise RuntimeError(f"LocalModelRegistry: role='{role}' is not registered")
+    import torch
 
-        import torch
+    tok = entry.tokenizer
+    model = entry.model
+    device = entry.device
 
-        tok = entry.tokenizer
-        model = entry.model
-        device = entry.device
+    if hasattr(tok, "apply_chat_template") and getattr(tok, "chat_template", None):
+        messages = [{"role": "user", "content": prompt}]
+        enc = tok.apply_chat_template(
+            messages,
+            add_generation_prompt=True,
+            tokenize=True,
+            return_tensors="pt",
+        )
 
-        # chat template 우선 (Qwen/Llama/Mistral 등 대부분 지원)
-        if hasattr(tok, "apply_chat_template") and getattr(tok, "chat_template", None):
-            messages = [{"role": "user", "content": prompt}]
-            input_ids = tok.apply_chat_template(
-                messages, add_generation_prompt=True, return_tensors="pt"
-            ).to(device)
+        # case 1: Tensor 반환
+        if isinstance(enc, torch.Tensor):
+            input_ids = enc.to(device)
             attention_mask = torch.ones_like(input_ids)
+
+        # case 2: BatchEncoding / dict 반환
         else:
-            enc = tok(prompt, return_tensors="pt", truncation=True, max_length=4096).to(device)
+            enc = enc.to(device)
             input_ids = enc["input_ids"]
             attention_mask = enc.get("attention_mask", torch.ones_like(input_ids))
+    else:
+        enc = tok(
+            prompt,
+            return_tensors="pt",
+            truncation=True,
+            max_length=4096,
+        ).to(device)
+        input_ids = enc["input_ids"]
+        attention_mask = enc.get("attention_mask", torch.ones_like(input_ids))
 
-        gen_kwargs: Dict[str, Any] = dict(entry.generate_kwargs)
-        gen_kwargs.setdefault("max_new_tokens", max_new_tokens or entry.max_new_tokens)
-        gen_kwargs.setdefault("do_sample", False)
-        if tok.eos_token_id is not None:
-            gen_kwargs.setdefault("pad_token_id", tok.eos_token_id)
+    gen_kwargs: Dict[str, Any] = dict(entry.generate_kwargs)
+    gen_kwargs.setdefault("max_new_tokens", max_new_tokens or entry.max_new_tokens)
+    gen_kwargs.setdefault("do_sample", False)
+    if tok.eos_token_id is not None:
+        gen_kwargs.setdefault("pad_token_id", tok.eos_token_id)
 
-        with torch.no_grad():
-            out = model.generate(
-                input_ids=input_ids,
-                attention_mask=attention_mask,
-                **gen_kwargs,
-            )
+    with torch.no_grad():
+        out = model.generate(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            **gen_kwargs,
+        )
 
-        # 입력 이후의 새 토큰만 디코딩
-        prompt_len = input_ids.shape[1]
-        new_tokens = out[0, prompt_len:]
-        text = tok.decode(new_tokens, skip_special_tokens=True)
-        return text.strip()
+    prompt_len = input_ids.shape[1]
+    new_tokens = out[0, prompt_len:]
+    text = tok.decode(new_tokens, skip_special_tokens=True)
+    return text.strip()
