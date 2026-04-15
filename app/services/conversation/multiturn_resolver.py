@@ -18,21 +18,32 @@ TODO:
 from app.schemas.session import Session
 
 
+REFERENCE_TOKENS = ["그거", "그 부분", "그 논문", "그 표", "아까", "that", "it"]
+
+
 def resolve(session: Session, user_text: str) -> str:
     text = user_text.strip()
     lowered = text.lower()
 
-    # 최근 메시지 중 가장 마지막 assistant/user 발화를 참조 후보로 사용한다.
-    recent = session.conversation.recent_messages[-2:] if session.conversation.recent_messages else []
+    recent = (
+        session.conversation.recent_messages[-4:]
+        if session.conversation.recent_messages
+        else []
+    )
     last_context = " ".join(m.text for m in recent).strip()
 
-    # resolved_refs가 있으면 우선 사용한다.
-    resolved_refs = session.conversation.summary.structured.established_facts
-    ref_hint = resolved_refs[-1] if resolved_refs else session.conversation.current_topic
+    anchor_candidates = [
+        session.conversation.last_resolved_anchor,
+        session.conversation.last_referenced_item,
+        session.conversation.summary.structured.current_focus,
+        session.conversation.current_topic,
+    ]
+    anchor = next((a for a in anchor_candidates if a and a.strip()), "")
 
-    if any(token in lowered for token in ["그거", "그 부분", "그 논문", "그 표", "아까", "that", "it"]):
-        anchor = ref_hint or last_context
+    if any(token in lowered for token in REFERENCE_TOKENS):
         if anchor:
             return f"{text} (reference: {anchor[:200]})"
+        if last_context:
+            return f"{text} (reference: {last_context[:200]})"
 
     return text

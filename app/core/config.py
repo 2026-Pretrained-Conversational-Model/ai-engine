@@ -2,13 +2,15 @@
 app/core/config.py
 ------------------
 역할: 환경 변수 기반 설정 단일 소스
-      프로세스 시작 시 1회 로드되고 settings로 주입됨
 
-TODO : 김예슬 (완)
-변경점(Colab 지원):
-- LLM_BACKEND 추가: "sagemaker" | "local"
-  - "sagemaker": 기존 boto3 엔드포인트 호출 (운영)
-  - "local":     LocalModelRegistry에 등록된 HuggingFace 모델을 in-process 호출 (Colab/개발)
+v12 변경:
+- MEMORY_UPDATE_ASYNC 제거 (분기 없음).
+  memory update는 Colab/FastAPI 둘 다에서 무조건 fire-and-forget(병렬).
+  Colab에서 실행이 안 되던 문제는 "영구 이벤트 루프 헬퍼"(노트북 측)로 해결.
+- MEMORY_UPDATE_EVERY_N_TURNS: user 턴 기준 3회마다 업데이트 LLM 호출.
+- ANSWER_MAX_NEW_TOKENS: answer 생성 상한 (200).
+- MEMORY_UPDATE_WINDOW_TURNS: 업데이트 LLM에 넣을 "직전 몇 턴" (기본 3).
+  user 3턴이면 messages = user+assistant 6개가 들어감.
 """
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
@@ -25,24 +27,21 @@ class Settings(BaseSettings):
     # Session memory cap
     SESSION_MAX_BYTES: int = 10 * 1024 * 1024
     SESSION_IDLE_TIMEOUT_MIN: int = 30
-    RECENT_MESSAGES_WINDOW: int = 6
+    RECENT_MESSAGES_WINDOW: int = 6  # prompt_builder에서 answer LLM에 넣을 최근 메시지 수
 
     # File storage
     LOCAL_FILE_DIR: str = "/tmp/ai-orchestrator"
     DELETE_FILE_ON_EXPIRE: bool = True
 
-    # ---- LLM backend selector ------------------------------------------------
-    # "sagemaker": 운영용. boto3로 SageMaker endpoint 호출.
-    # "local":     개발/Colab용. LocalModelRegistry에 등록된 HF 모델 직접 호출.
-    # LLM_BACKEND: str = "sagemaker"
-    LLM_BACKEND: str = "local"
-
-    # SageMaker (LLM_BACKEND=sagemaker 일 때만 사용)
+    # LLM backend
+    LLM_BACKEND: str = "sagemaker"  # "local" or "sagemaker"
     AWS_REGION: str = "ap-northeast-2"
-    SAGEMAKER_LLM_ENDPOINT: str = ""
+    SAGEMAKER_ANSWER_ENDPOINT: str = ""
+    SAGEMAKER_ROUTER_ENDPOINT: str = ""
+    SAGEMAKER_SUMMARY_ENDPOINT: str = ""
     SAGEMAKER_VLM_ENDPOINT: str = ""
-    SAGEMAKER_TIMEOUT_SEC: int = 60
 
+    SAGEMAKER_TIMEOUT_SEC: int = 60
     # Embedding
     EMBEDDING_MODEL_NAME: str = "jhgan/ko-sroberta-multitask"
     EMBEDDING_DEVICE: str = "cpu"
@@ -52,6 +51,15 @@ class Settings(BaseSettings):
     PDF_CHUNK_SIZE: int = 800
     PDF_CHUNK_OVERLAP: int = 100
     RAG_TOP_K: int = 4
+
+    # ---- v12: memory update policy ------------------------------------------
+    # user 턴 기준 N회마다 memory LLM 호출 (3=3턴에 1번)
+    MEMORY_UPDATE_EVERY_N_TURNS: int = 3
+    # update LLM에 넣을 직전 turn 수 (user 기준). 3턴이면 user+assistant 6메시지.
+    MEMORY_UPDATE_WINDOW_TURNS: int = 3
+
+    # answer 생성 토큰 상한 (latency + 언어 드리프트 제어)
+    ANSWER_MAX_NEW_TOKENS: int = 200
 
 
 settings = Settings()

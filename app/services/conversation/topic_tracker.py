@@ -11,5 +11,5 @@ from app.schemas.session import Session
 
 
 def update_topic(session: Session, user_text: str) -> None:
-    # placeholder: keep last 60 chars of user text as topic
-    session.conversation.current_topic = user_text.strip()[:60]
+    if not session.conversation.current_topic.strip():
+        session.conversation.current_topic = user_text.strip()[:60]

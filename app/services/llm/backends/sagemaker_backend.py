@@ -26,37 +26,45 @@ class _SageMakerRuntimeMixin:
             cls._client = boto3.client("sagemaker-runtime", region_name=settings.AWS_REGION)
         return cls._client
 
-
 class SageMakerLLMBackend(_SageMakerRuntimeMixin, LLMBackend):
+    def _endpoint_for_role(self, role: str) -> str:
+        if role == "answer":
+            return settings.SAGEMAKER_ANSWER_ENDPOINT
+        if role == "router":
+            return settings.SAGEMAKER_ROUTER_ENDPOINT
+        if role in ("summary", "memory"):
+            return settings.SAGEMAKER_SUMMARY_ENDPOINT
+        raise ValueError(f"Unsupported role: {role}")
+
     async def generate(
         self,
         prompt: str,
         role: str = "answer",
         max_new_tokens: int = 1024,
+        system: str | None = None,
     ) -> str:
-        # 현재 운영 구성은 single answer endpoint. router/summary를 별도 엔드포인트로
-        # 분리하고 싶으면 여기서 role → EndpointName 매핑을 분기하면 된다.
+        endpoint_name = self._endpoint_for_role(role)
+
         payload = {
-            "inputs": prompt,
-            "parameters": {
-                "max_new_tokens": max_new_tokens,
-                "temperature": 0.3,
-                "do_sample": True,
-            },
+            "system": system or "",
+            "user": prompt,
+            "max_new_tokens": max_new_tokens,
+            "role": role,
         }
+
         try:
             resp = self._runtime().invoke_endpoint(
-                EndpointName=settings.SAGEMAKER_LLM_ENDPOINT,
+                EndpointName=endpoint_name,
                 ContentType="application/json",
+                Accept="application/json",
                 Body=json.dumps(payload),
             )
-            body = json.loads(resp["Body"].read())
-            if isinstance(body, list) and body and "generated_text" in body[0]:
-                return body[0]["generated_text"]
-            return body.get("generated_text", str(body))
+            body = json.loads(resp["Body"].read().decode("utf-8"))
+            return body.get("text", str(body))
         except Exception as e:
             logger.exception("SageMaker LLM invoke failed: %s", e)
             return "[LLM invocation error]"
+
 
 
 class SageMakerVLMBackend(_SageMakerRuntimeMixin, VLMBackend):

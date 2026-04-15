@@ -33,3 +33,5 @@ class Conversation(BaseModel):
     summary: Summary = Field(default_factory=Summary)
     current_topic: str = ""
     last_user_intent: str = ""
+    last_resolved_anchor: str = ""
+    last_referenced_item: str = ""
