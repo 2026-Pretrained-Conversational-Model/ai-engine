@@ -1,15 +1,6 @@
-"""
-app/core/logger.py
-------------------
-역할: 중앙 집중식 로거 생성 팩토리
-      모든 모듈은 `get_logger(__name__)`를 통해 로거를 사용
-
-TODO: 김예슬
-    [완] session_id 바인딩을 지원하는 structlog로 전환
-    [미완] 운영 환경에서 CloudWatch로 로그 전송
-"""
 import logging
 import json
+import time
 from app.core.config import settings
 
 
@@ -25,9 +16,6 @@ def get_logger(name: str) -> logging.Logger:
     return logger
 
 
-# ===============================
-# 🔥 추가: 구조화 로그 헬퍼
-# ===============================
 def _safe_json(data):
     try:
         return json.dumps(data, ensure_ascii=False, default=str)
@@ -35,27 +23,40 @@ def _safe_json(data):
         return str(data)
 
 
+def log_state(logger, label: str, **kwargs):
+    payload = dict(kwargs)
+    payload["ts"] = time.time()
+    logger.info(f"[STATE] {label} | {_safe_json(payload)}")
+
+
 def log_stage_start(logger, stage: str, **kwargs):
+    start_time = time.perf_counter()
     logger.info(f"[START] {stage} | {_safe_json(kwargs)}")
+    return start_time
 
 
-def log_stage_end(logger, stage: str, **kwargs):
-    logger.info(f"[END] {stage} | {_safe_json(kwargs)}")
+def log_stage_end(logger, stage: str, start_time: float | None = None, **kwargs):
+    payload = dict(kwargs)
 
+    if start_time is not None:
+        payload["latency_ms"] = round((time.perf_counter() - start_time) * 1000, 2)
 
-def log_state(logger, title: str, **kwargs):
-    logger.info(f"[STATE] {title} | {_safe_json(kwargs)}")
+    logger.info(f"[END] {stage} | {_safe_json(payload)}")
 
 
 def log_memory(logger, session, label: str):
     try:
-        memory = getattr(session, "memory_state", None)
+        conversation = getattr(session, "conversation", None)
         pdf = getattr(session, "pdf_state", None)
         runtime = getattr(session, "runtime_state", None)
 
+        summary = getattr(conversation, "summary", None) if conversation else None
+        recent_messages = getattr(conversation, "recent_messages", []) if conversation else []
+
         payload = {
             "label": label,
-            "memory": memory.model_dump() if hasattr(memory, "model_dump") else str(memory),
+            "summary": summary.model_dump() if hasattr(summary, "model_dump") else str(summary),
+            "recent_messages_count": len(recent_messages),
             "pdf": pdf.model_dump() if hasattr(pdf, "model_dump") else str(pdf),
             "runtime": runtime.model_dump() if hasattr(runtime, "model_dump") else str(runtime),
         }
