@@ -60,7 +60,31 @@ async def _run_memory_update(session_id: str) -> None:
         from app.services.memory.memory_state_generator import update_memory_state
 
         session = await get_or_create(session_id)
+        logger.info(
+            "[MEMORY_UPDATE] finalize_start | recent_messages=%d summary_narrative_len=%d facts=%d",
+            len(session.conversation.recent_messages),
+            len(session.conversation.summary.narrative or ""),
+            len(session.conversation.summary.structured.established_facts or []),
+        )
+
         await update_memory_state(session)
+
+        logger.info(
+            "[MEMORY_UPDATE] finalize_done | summary=%s",
+            json.dumps(
+                {
+                    "narrative": session.conversation.summary.narrative,
+                    "structured": {
+                        "goal": session.conversation.summary.structured.goal,
+                        "established_facts": session.conversation.summary.structured.established_facts,
+                        "current_focus": session.conversation.summary.structured.current_focus,
+                        "unresolved_questions": session.conversation.summary.structured.unresolved_questions,
+                    },
+                },
+                ensure_ascii=False,
+            ),
+        )
+
         await save_session(session)
         logger.debug("memory refresh done: session=%s", session_id)
     except Exception as e:
