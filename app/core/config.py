@@ -3,10 +3,12 @@ app/core/config.py
 ------------------
 역할: 환경 변수 기반 설정 단일 소스
 
-v12 변경 + 로컬 테스트 지원:
+TODO
+김예슬[완]
 - SAGEMAKER_BASE_URL: 비어있으면 boto3(운영), 설정하면 HTTP(로컬 테스트).
   예: SAGEMAKER_BASE_URL=http://localhost:9000
   → sagemaker_backend.py가 boto3 대신 http://localhost:9000/generate 호출.
+
 """
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
@@ -35,7 +37,7 @@ class Settings(BaseSettings):
     AWS_REGION: str = "ap-northeast-2"
     SAGEMAKER_ANSWER_ENDPOINT: str = "ai-orchestrator-answer-v1"
     SAGEMAKER_ROUTER_ENDPOINT: str = "ai-orchestrator-router-v1"
-    SAGEMAKER_SUMMARY_ENDPOINT: str = "i-orchestrator-memory-v1"
+    SAGEMAKER_SUMMARY_ENDPOINT: str = "ai-orchestrator-memory-v1"   # ← 오타 수정
     SAGEMAKER_VLM_ENDPOINT: str = "qwen25-vlm-async"
     SAGEMAKER_TIMEOUT_SEC: int = 120
 

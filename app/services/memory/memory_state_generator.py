@@ -16,10 +16,15 @@ v12 설계 — 입력 구성:
     놓치는 턴이 없음. 1턴씩 잘라서 3번 돌리는 게 아니라, 3턴 뭉치를 1번에
     LLM에게 "이 흐름을 기존 summary에 녹여줘"라고 위임하는 구조.
 
-LocalModelRegistry role 우선순위:
+v13 변경 (sagemaker 연동):
+- LLM_BACKEND == "sagemaker"면 LLMClient(role="memory") 호출.
+  sagemaker_backend가 SAGEMAKER_SUMMARY_ENDPOINT로 라우팅.
+- LLM_BACKEND == "local"면 기존 LocalModelRegistry 경로 유지.
+  둘 다 안 되는 경우에만 no-op.
+
+LocalModelRegistry role 우선순위 (local 모드에서만 사용):
     1) "memory"
-    2) "summary"  (g34634/qwen2.5-3b-memory-summary-v1 등)
-    둘 다 없으면 no-op.
+    2) "summary"
 """
 from __future__ import annotations
 
@@ -32,6 +37,7 @@ from app.core.config import settings
 from app.core.logger import get_logger
 from app.schemas.session import Session
 from app.schemas.conversation import StructuredSummary, Message
+from app.services.llm.llm_client import LLMClient
 from app.services.llm.local_registry import LocalModelRegistry
 
 logger = get_logger(__name__)
@@ -72,12 +78,16 @@ MEMORY_SYSTEM_PROMPT = """당신은 멀티턴 대화 시스템에서 세션 메�
 
 _JSON_RE = re.compile(r"\{.*\}", re.DOTALL)
 
+# memory 출력 JSON 최대 토큰
+_MEMORY_MAX_NEW_TOKENS = 300
+
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 
-def _resolve_role() -> Optional[str]:
+def _resolve_local_role() -> Optional[str]:
+    """local 모드일 때 사용 가능한 registry role 선택."""
     if LocalModelRegistry.has("memory"):
         return "memory"
     if LocalModelRegistry.has("summary"):
@@ -191,6 +201,44 @@ def _apply_to_session(session: Session, parsed: dict) -> None:
 
 
 # ---------------------------------------------------------------------------
+# LLM generation dispatchers
+# ---------------------------------------------------------------------------
+
+async def _generate_via_local(user_prompt: str) -> Optional[str]:
+    """LocalModelRegistry 경로. 등록된 role이 없으면 None."""
+    role = _resolve_local_role()
+    if role is None:
+        logger.debug("memory_state (local): no 'memory'/'summary' model registered, skip")
+        return None
+
+    logger.info(
+        "[MEMORY_GEN] backend=local role=%s window_turns=%d input_len=%d",
+        role, settings.MEMORY_UPDATE_WINDOW_TURNS, len(user_prompt),
+    )
+    return await asyncio.to_thread(
+        LocalModelRegistry.generate,
+        role,
+        user_prompt,
+        _MEMORY_MAX_NEW_TOKENS,
+        MEMORY_SYSTEM_PROMPT,
+    )
+
+
+async def _generate_via_sagemaker(user_prompt: str) -> str:
+    """LLMClient(role='memory') → SAGEMAKER_SUMMARY_ENDPOINT."""
+    logger.info(
+        "[MEMORY_GEN] backend=sagemaker role=memory window_turns=%d input_len=%d",
+        settings.MEMORY_UPDATE_WINDOW_TURNS, len(user_prompt),
+    )
+    return await LLMClient.generate(
+        prompt=user_prompt,
+        role="memory",
+        max_new_tokens=_MEMORY_MAX_NEW_TOKENS,
+        system=MEMORY_SYSTEM_PROMPT,
+    )
+
+
+# ---------------------------------------------------------------------------
 # Public entry
 # ---------------------------------------------------------------------------
 
@@ -203,28 +251,23 @@ async def update_memory_state(session: Session) -> None:
     - JSON 파싱 성공 시 session.conversation.summary에 반영.
     - 실패/미등록이면 graceful no-op (기존 summary 그대로 유지).
     """
-    role = _resolve_role()
-    if role is None:
-        logger.debug("memory_state: no 'memory'/'summary' model registered, skip")
-        return
-
     user_prompt = _build_memory_input(session)
-
-    logger.info(
-        "[MEMORY_GEN] role=%s window_turns=%d input_len=%d",
-        role,
-        settings.MEMORY_UPDATE_WINDOW_TURNS,
-        len(user_prompt),
-    )
+    backend = (settings.LLM_BACKEND or "").lower()
 
     try:
-        raw = await asyncio.to_thread(
-            LocalModelRegistry.generate,
-            role,
-            user_prompt,
-            300,                      # memory 출력 JSON 최대 토큰
-            MEMORY_SYSTEM_PROMPT,
-        )
+        if backend == "local":
+            raw = await _generate_via_local(user_prompt)
+            if raw is None:
+                return
+        else:
+            # sagemaker 모드 (기본)
+            raw = await _generate_via_sagemaker(user_prompt)
+
+        # 에러 sentinel 필터링 — sagemaker_backend가 실패 시 "[LLM invocation error...]" 리턴함
+        if not raw or raw.startswith("[LLM invocation error") or raw.startswith("[HTTP backend error"):
+            logger.warning("[MEMORY_GEN] backend returned error sentinel: %r", raw[:200] if raw else raw)
+            return
+
         parsed = _parse_memory_state(raw)
         if parsed:
             _apply_to_session(session, parsed)

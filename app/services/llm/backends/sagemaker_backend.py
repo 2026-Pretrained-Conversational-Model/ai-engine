@@ -3,27 +3,24 @@ app/services/llm/backends/sagemaker_backend.py
 ---------------------------------------------
 역할: SageMaker 또는 호환 HTTP 엔드포인트를 통한 LLM 호출.
 
-두 가지 모드:
-    1) boto3 모드 (운영):
-       SAGEMAKER_BASE_URL이 비어있으면 boto3로 실제 SageMaker endpoint 호출.
-       endpoint 이름은 settings.SAGEMAKER_ANSWER_ENDPOINT 등.
+서버(deploy/sagemaker_code/inference.py) 계약 — 반드시 지킨다:
+    입력:  {"system": str, "user": str, "max_new_tokens": int}
+    출력:  {"text": str}
+    헤더:  Content-Type == "application/json"
+           Accept       == "application/json"  (정확히 일치해야 함)
 
-    2) HTTP 모드 (로컬 테스트):
-       SAGEMAKER_BASE_URL이 설정되면 (예: http://localhost:9000)
-       boto3 대신 해당 URL의 /generate 엔드포인트로 HTTP POST 호출.
+v13 변경:
+- role 키를 서버 payload에서 제거 (서버는 무시하지만 계약 엄수).
+- UTF-8 bytes로 인코딩해서 전송 (한국어 프롬프트 그대로).
+- invoke_endpoint를 asyncio.to_thread로 감싸 이벤트 루프 블로킹 방지.
+- ClientError에서 서버가 반환한 실제 에러 본문을 끌어와 로그에 남김.
+- 응답이 non-JSON이거나 "text" 키가 없는 경우를 방어적으로 처리.
+
+두 가지 모드:
+    1) boto3 모드 (운영): SAGEMAKER_BASE_URL=""
+    2) HTTP 모드 (로컬 테스트): SAGEMAKER_BASE_URL 설정
        tools/dummy_sagemaker.py를 띄워놓으면 실제 모델 없이
        파이프라인 전체가 돌아가는지 테스트 가능.
-
-요청 페이로드 (두 모드 동일):
-    {
-        "system": "...",
-        "user": "...",
-        "max_new_tokens": 200,
-        "role": "answer"   // "answer" | "router" | "memory" | "summary"
-    }
-
-응답 페이로드 (두 모드 동일):
-    { "text": "..." }
 """
 from __future__ import annotations
 
@@ -31,7 +28,7 @@ import asyncio
 import json
 from typing import Optional
 from urllib.request import Request, urlopen
-from urllib.error import URLError
+from urllib.error import URLError, HTTPError
 
 from app.core.config import settings
 from app.core.logger import get_logger
@@ -62,19 +59,57 @@ class _SageMakerRuntimeMixin:
 # ---------------------------------------------------------------------------
 
 def _http_post_sync(url: str, payload: dict) -> dict:
-    """
-    stdlib urllib으로 동기 HTTP POST. 추가 pip 의존성 없음.
-    asyncio.to_thread()로 감싸서 이벤트 루프를 블로킹하지 않는다.
-    """
-    data = json.dumps(payload).encode("utf-8")
+    """stdlib urllib으로 동기 HTTP POST. asyncio.to_thread()로 감싸서 호출."""
+    data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
     req = Request(
         url,
         data=data,
-        headers={"Content-Type": "application/json", "Accept": "application/json"},
+        headers={
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+        },
         method="POST",
     )
-    with urlopen(req, timeout=settings.SAGEMAKER_TIMEOUT_SEC) as resp:
-        return json.loads(resp.read().decode("utf-8"))
+    try:
+        with urlopen(req, timeout=settings.SAGEMAKER_TIMEOUT_SEC) as resp:
+            return json.loads(resp.read().decode("utf-8"))
+    except HTTPError as e:
+        body_preview = ""
+        try:
+            body_preview = e.read().decode("utf-8", errors="replace")[:500]
+        except Exception:
+            pass
+        logger.error("HTTP %s from %s: %s | body=%r", e.code, url, e.reason, body_preview)
+        raise
+
+
+# ---------------------------------------------------------------------------
+# 에러 본문 추출 헬퍼
+# ---------------------------------------------------------------------------
+
+def _extract_boto_error(exc: Exception) -> str:
+    """
+    boto3 ClientError에서 서버가 돌려준 실제 상세 메시지를 뽑아 로그용 문자열로 정리.
+    ModelError의 경우 CloudWatch 링크도 같이 찍어준다.
+    """
+    try:
+        from botocore.exceptions import ClientError
+        if isinstance(exc, ClientError):
+            err = exc.response.get("Error", {}) or {}
+            meta = exc.response.get("ResponseMetadata", {}) or {}
+            parts = [
+                f"code={err.get('Code')!r}",
+                f"status={meta.get('HTTPStatusCode')}",
+                f"msg={err.get('Message')!r}",
+            ]
+            # SageMaker ModelError는 OriginalStatusCode / OriginalMessage를 별도로 담아줌
+            for k in ("OriginalStatusCode", "OriginalMessage", "LogStreamArn"):
+                if k in exc.response:
+                    parts.append(f"{k}={exc.response[k]!r}")
+            return " | ".join(parts)
+    except Exception:
+        pass
+    return f"{type(exc).__name__}: {exc}"
 
 
 # ---------------------------------------------------------------------------
@@ -84,6 +119,7 @@ def _http_post_sync(url: str, payload: dict) -> dict:
 class SageMakerLLMBackend(_SageMakerRuntimeMixin, LLMBackend):
 
     def _endpoint_for_role(self, role: str) -> str:
+        """role → 실제 SageMaker endpoint 이름 매핑 (클라 측 라우팅)."""
         if role == "answer":
             return settings.SAGEMAKER_ANSWER_ENDPOINT
         if role == "router":
@@ -99,11 +135,12 @@ class SageMakerLLMBackend(_SageMakerRuntimeMixin, LLMBackend):
         max_new_tokens: int = 1024,
         system: Optional[str] = None,
     ) -> str:
+        # 서버 contract에 정확히 맞는 페이로드만 구성.
+        # role은 엔드포인트 선택에만 사용하고 body에는 안 넣는다.
         payload = {
             "system": system or "",
-            "user": prompt,
-            "max_new_tokens": max_new_tokens,
-            "role": role,
+            "user": prompt or "",
+            "max_new_tokens": int(max_new_tokens),
         }
 
         base_url = getattr(settings, "SAGEMAKER_BASE_URL", "")
@@ -113,32 +150,67 @@ class SageMakerLLMBackend(_SageMakerRuntimeMixin, LLMBackend):
             url = f"{base_url.rstrip('/')}/generate"
             try:
                 body = await asyncio.to_thread(_http_post_sync, url, payload)
-                return body.get("text", str(body))
-            except URLError as e:
-                logger.error(
-                    "HTTP backend call failed (url=%s role=%s): %s. "
-                    "dummy_sagemaker가 실행 중인지 확인하세요.",
-                    url, role, e,
-                )
-                return f"[HTTP backend error: {e}]"
+                text = body.get("text")
+                if not isinstance(text, str):
+                    logger.error("HTTP backend response missing 'text': %r", body)
+                    return "[LLM invocation error: no text field]"
+                return text
+            except (URLError, HTTPError) as e:
+                logger.error("HTTP backend failed (url=%s role=%s): %s", url, role, e)
+                return "[LLM invocation error]"
             except Exception as e:
                 logger.exception("HTTP backend unexpected error: %s", e)
-                return f"[HTTP backend error: {e}]"
+                return "[LLM invocation error]"
 
         # ---- boto3 모드 (운영) -----------------------------------------------
         endpoint_name = self._endpoint_for_role(role)
-        try:
-            resp = self._runtime().invoke_endpoint(
+
+        # UTF-8 bytes로 보내 한국어를 있는 그대로 전달. 서버 json.loads는 bytes OK.
+        body_bytes = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+
+        def _invoke():
+            return self._runtime().invoke_endpoint(
                 EndpointName=endpoint_name,
                 ContentType="application/json",
                 Accept="application/json",
-                Body=json.dumps(payload),
+                Body=body_bytes,
             )
-            body = json.loads(resp["Body"].read().decode("utf-8"))
-            return body.get("text", str(body))
+
+        try:
+            resp = await asyncio.to_thread(_invoke)
         except Exception as e:
-            logger.exception("SageMaker LLM invoke failed: %s", e)
+            logger.error(
+                "SageMaker invoke_endpoint failed | endpoint=%s role=%s | %s",
+                endpoint_name, role, _extract_boto_error(e),
+            )
             return "[LLM invocation error]"
+
+        # 응답 본문 파싱 (방어적)
+        try:
+            raw_bytes = resp["Body"].read()
+            raw_text = raw_bytes.decode("utf-8", errors="replace")
+        except Exception as e:
+            logger.exception("SageMaker response read failed: %s", e)
+            return "[LLM invocation error: response read failed]"
+
+        try:
+            body = json.loads(raw_text)
+        except json.JSONDecodeError:
+            logger.error(
+                "SageMaker response is not JSON | endpoint=%s | raw=%r",
+                endpoint_name, raw_text[:500],
+            )
+            return "[LLM invocation error: non-JSON response]"
+
+        text = body.get("text")
+        if not isinstance(text, str):
+            logger.error(
+                "SageMaker response missing 'text' field | endpoint=%s | body=%r",
+                endpoint_name, body,
+            )
+            return "[LLM invocation error: no text field]"
+
+        return text
 
 
 # ---------------------------------------------------------------------------
@@ -164,14 +236,20 @@ class SageMakerVLMBackend(_SageMakerRuntimeMixin, VLMBackend):
             "inputs": {"text": prompt, "image": image_b64},
             "parameters": {"max_new_tokens": max_new_tokens, "temperature": 0.3},
         }
-        try:
-            resp = self._runtime().invoke_endpoint(
+        body_bytes = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+
+        def _invoke():
+            return self._runtime().invoke_endpoint(
                 EndpointName=settings.SAGEMAKER_VLM_ENDPOINT,
                 ContentType="application/json",
-                Body=json.dumps(payload),
+                Accept="application/json",
+                Body=body_bytes,
             )
-            body = json.loads(resp["Body"].read())
-            return body.get("generated_text", str(body))
+
+        try:
+            resp = await asyncio.to_thread(_invoke)
+            body = json.loads(resp["Body"].read().decode("utf-8"))
+            return body.get("generated_text") or body.get("text") or str(body)
         except Exception as e:
-            logger.exception("SageMaker VLM invoke failed: %s", e)
+            logger.error("SageMaker VLM invoke failed: %s", _extract_boto_error(e))
             return "[VLM invocation error]"
