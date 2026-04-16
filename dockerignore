@@ -1,0 +1,20 @@
+# .dockerignore — GPU 이미지 빌드 시 제외할 파일
+__pycache__
+*.pyc
+*.pyo
+.git
+.gitignore
+.env
+.env.*
+env.local-test
+notebooks/
+tests/
+*.md
+*.ipynb
+Dockerfile
+Dockerfile.gpu
+docker-compose*.yml
+uploads/
+*.tar.gz
+*.zip
+__MACOSX/

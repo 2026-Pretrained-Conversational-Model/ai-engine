@@ -1,0 +1,23 @@
+# requirements.gpu.txt
+# GPU Docker 이미지용 — torch는 베이스 이미지(pytorch/pytorch)에 포함되어 있으므로 제외.
+# torch를 여기 넣으면 CPU 버전으로 덮어씌워져 CUDA가 깨짐!
+
+fastapi==0.115.0
+uvicorn[standard]==0.32.0
+pydantic==2.9.2
+pydantic-settings==2.5.2
+python-multipart==0.0.12
+
+# LLM / Embedding
+transformers>=4.45.0
+accelerate>=0.34.0
+bitsandbytes>=0.44.0
+sentence-transformers==3.1.1
+
+# RAG / PDF
+faiss-cpu==1.8.0
+pypdf==5.0.0
+langchain-text-splitters
+
+# Misc (numpy는 Dockerfile에서 별도 핀 — 여기 넣으면 순서 꼬임)
+boto3==1.35.0
