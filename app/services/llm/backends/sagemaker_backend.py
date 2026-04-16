@@ -115,7 +115,134 @@ def _extract_boto_error(exc: Exception) -> str:
 # ---------------------------------------------------------------------------
 # LLM Backend
 # ---------------------------------------------------------------------------
+# class SageMakerLLMBackend(_SageMakerRuntimeMixin, LLMBackend):
 
+#     def _endpoint_for_role(self, role: str) -> str:
+#         """role → 실제 SageMaker endpoint 이름 매핑 (클라 측 라우팅)."""
+#         if role == "answer":
+#             return settings.SAGEMAKER_ANSWER_ENDPOINT
+#         if role == "router":
+#             return settings.SAGEMAKER_ROUTER_ENDPOINT
+#         if role in ("summary", "memory"):
+#             return settings.SAGEMAKER_SUMMARY_ENDPOINT
+#         raise ValueError(f"Unsupported role: {role}")
+
+#     def _build_qwen_prompt(self, system: str, user: str) -> str:
+#         parts = []
+#         if system:
+#             parts.append(f"<|im_start|>system\n{system}<|im_end|>")
+#         parts.append(f"<|im_start|>user\n{user}<|im_end|>")
+#         parts.append("<|im_start|>assistant\n")
+#         return "\n".join(parts)
+
+#     async def generate(
+#         self,
+#         prompt: str,
+#         role: str = "answer",
+#         max_new_tokens: int = 1024,
+#         system: Optional[str] = None,
+#     ) -> str:
+#         # HF pipeline 기본 포맷
+#         formatted = self._build_qwen_prompt(system or "", prompt or "")
+#         payload = {
+#             "inputs": formatted,
+#             "parameters": {
+#                 "max_new_tokens": int(max_new_tokens),
+#                 "do_sample": False,
+#                 "return_full_text": False,
+#                 "stop": ["<|im_end|>", "<|endoftext|>"],
+#             },
+#         }
+
+#         base_url = getattr(settings, "SAGEMAKER_BASE_URL", "")
+
+#         # ---- HTTP 모드 (로컬 테스트) -----------------------------------------
+#         if base_url:
+#             url = f"{base_url.rstrip('/')}/generate"
+#             try:
+#                 body = await asyncio.to_thread(_http_post_sync, url, payload)
+
+#                 if isinstance(body, list) and body:
+#                     text = body[0].get("generated_text", "").strip()
+#                     return text
+
+#                 if isinstance(body, dict):
+#                     text = body.get("generated_text", body.get("text", "")).strip()
+#                     return text
+
+#                 logger.error("HTTP backend unexpected response format: %r", body)
+#                 return "[LLM invocation error: invalid response format]"
+
+#             except (URLError, HTTPError) as e:
+#                 logger.error("HTTP backend failed (url=%s role=%s): %s", url, role, e)
+#                 return "[LLM invocation error]"
+#             except Exception as e:
+#                 logger.exception("HTTP backend unexpected error: %s", e)
+#                 return "[LLM invocation error]"
+
+#         # ---- boto3 모드 (운영) -----------------------------------------------
+#         endpoint_name = self._endpoint_for_role(role)
+#         body_bytes = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+
+#         def _invoke():
+#             return self._runtime().invoke_endpoint(
+#                 EndpointName=endpoint_name,
+#                 ContentType="application/json",
+#                 Accept="application/json",
+#                 Body=body_bytes,
+#             )
+
+#         try:
+#             resp = await asyncio.to_thread(_invoke)
+#         except Exception as e:
+#             logger.error(
+#                 "SageMaker invoke_endpoint failed | endpoint=%s role=%s | %s",
+#                 endpoint_name, role, _extract_boto_error(e),
+#             )
+#             return "[LLM invocation error]"
+
+#         try:
+#             raw_bytes = resp["Body"].read()
+#             raw_text = raw_bytes.decode("utf-8", errors="replace")
+#         except Exception as e:
+#             logger.exception("SageMaker response read failed: %s", e)
+#             return "[LLM invocation error: response read failed]"
+
+#         try:
+#             body = json.loads(raw_text)
+#         except json.JSONDecodeError:
+#             logger.error(
+#                 "SageMaker response is not JSON | endpoint=%s | raw=%r",
+#                 endpoint_name, raw_text[:500],
+#             )
+#             return "[LLM invocation error: non-JSON response]"
+
+#         # HF pipeline 응답 파싱
+#         if isinstance(body, list) and body:
+#             text = body[0].get("generated_text", "").strip()
+#             if not text:
+#                 logger.error(
+#                     "SageMaker response list missing 'generated_text' | endpoint=%s | body=%r",
+#                     endpoint_name, body,
+#                 )
+#                 return "[LLM invocation error: no generated_text field]"
+#             return text
+
+#         if isinstance(body, dict):
+#             text = body.get("generated_text", body.get("text", "")).strip()
+#             if not text:
+#                 logger.error(
+#                     "SageMaker response dict missing text fields | endpoint=%s | body=%r",
+#                     endpoint_name, body,
+#                 )
+#                 return "[LLM invocation error: no text field]"
+#             return text
+
+#         logger.error(
+#             "SageMaker response unexpected format | endpoint=%s | body=%r",
+#             endpoint_name, body,
+#         )
+#         return "[LLM invocation error: invalid response format]"
 class SageMakerLLMBackend(_SageMakerRuntimeMixin, LLMBackend):
 
     def _endpoint_for_role(self, role: str) -> str:
@@ -127,6 +254,15 @@ class SageMakerLLMBackend(_SageMakerRuntimeMixin, LLMBackend):
         if role in ("summary", "memory"):
             return settings.SAGEMAKER_SUMMARY_ENDPOINT
         raise ValueError(f"Unsupported role: {role}")
+    
+    ##[추후 변경] - parsing 을 위한 로직 (sageMaker 연결용)
+    def _build_qwen_prompt(system: str, user: str) -> str:
+        parts = []
+        if system:
+            parts.append(f"<|im_start|>system\n{system}<|im_end|>")
+        parts.append(f"<|im_start|>user\n{user}<|im_end|>")
+        parts.append("<|im_start|>assistant\n")
+        return "\n".join(parts)
 
     async def generate(
         self,
@@ -142,6 +278,18 @@ class SageMakerLLMBackend(_SageMakerRuntimeMixin, LLMBackend):
             "user": prompt or "",
             "max_new_tokens": int(max_new_tokens),
         }
+        
+        #[sagemaker_code/inference.py]의 계약에 맞게 프롬프트 포맷팅
+        # formatted = _build_qwen_prompt(system or "", prompt or "")
+        # payload = {
+        #     "inputs": formatted,
+        #     "parameters": {
+        #         "max_new_tokens": int(max_new_tokens),
+        #         "do_sample": False,
+        #         "return_full_text": False,
+        #         "stop": ["<|im_end|>", "<|endoftext|>"],
+        #     },
+        # }
 
         base_url = getattr(settings, "SAGEMAKER_BASE_URL", "")
 

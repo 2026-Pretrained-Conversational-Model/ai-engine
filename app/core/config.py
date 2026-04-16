@@ -32,7 +32,7 @@ class Settings(BaseSettings):
     DELETE_FILE_ON_EXPIRE: bool = True
 
     # ---- LLM backend ---------------------------------------------------------
-    LLM_BACKEND: str = "sagemaker"   # "local" (Colab) or "sagemaker" (운영/테스트)
+    LLM_BACKEND: str = "local"   # "local" (Colab) or "sagemaker" (운영/테스트)
 
     AWS_REGION: str = "ap-northeast-2"
     SAGEMAKER_ANSWER_ENDPOINT: str = "ai-orchestrator-answer-v1"
