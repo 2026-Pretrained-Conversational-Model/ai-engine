@@ -19,7 +19,7 @@ class Settings(BaseSettings):
     # App
     APP_NAME: str = "ai-orchestrator"
     APP_HOST: str = "0.0.0.0"
-    APP_PORT: int = 8888
+    APP_PORT: int = 8000
     LOG_LEVEL: str = "INFO"
 
     # Session memory cap
