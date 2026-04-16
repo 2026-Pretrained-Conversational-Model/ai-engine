@@ -3,14 +3,10 @@ app/core/config.py
 ------------------
 역할: 환경 변수 기반 설정 단일 소스
 
-v12 변경:
-- MEMORY_UPDATE_ASYNC 제거 (분기 없음).
-  memory update는 Colab/FastAPI 둘 다에서 무조건 fire-and-forget(병렬).
-  Colab에서 실행이 안 되던 문제는 "영구 이벤트 루프 헬퍼"(노트북 측)로 해결.
-- MEMORY_UPDATE_EVERY_N_TURNS: user 턴 기준 3회마다 업데이트 LLM 호출.
-- ANSWER_MAX_NEW_TOKENS: answer 생성 상한 (200).
-- MEMORY_UPDATE_WINDOW_TURNS: 업데이트 LLM에 넣을 "직전 몇 턴" (기본 3).
-  user 3턴이면 messages = user+assistant 6개가 들어감.
+v12 변경 + 로컬 테스트 지원:
+- SAGEMAKER_BASE_URL: 비어있으면 boto3(운영), 설정하면 HTTP(로컬 테스트).
+  예: SAGEMAKER_BASE_URL=http://localhost:9000
+  → sagemaker_backend.py가 boto3 대신 http://localhost:9000/generate 호출.
 """
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
@@ -27,21 +23,27 @@ class Settings(BaseSettings):
     # Session memory cap
     SESSION_MAX_BYTES: int = 10 * 1024 * 1024
     SESSION_IDLE_TIMEOUT_MIN: int = 30
-    RECENT_MESSAGES_WINDOW: int = 6  # prompt_builder에서 answer LLM에 넣을 최근 메시지 수
+    RECENT_MESSAGES_WINDOW: int = 6
 
     # File storage
     LOCAL_FILE_DIR: str = "/tmp/ai-orchestrator"
     DELETE_FILE_ON_EXPIRE: bool = True
 
-    # LLM backend
-    LLM_BACKEND: str = "sagemaker"  # "local" or "sagemaker"
-    AWS_REGION: str = "ap-northeast-2"
-    SAGEMAKER_ANSWER_ENDPOINT: str = ""
-    SAGEMAKER_ROUTER_ENDPOINT: str = ""
-    SAGEMAKER_SUMMARY_ENDPOINT: str = ""
-    SAGEMAKER_VLM_ENDPOINT: str = ""
+    # ---- LLM backend ---------------------------------------------------------
+    LLM_BACKEND: str = "sagemaker"   # "local" (Colab) or "sagemaker" (운영/테스트)
 
-    SAGEMAKER_TIMEOUT_SEC: int = 60
+    AWS_REGION: str = "ap-northeast-2"
+    SAGEMAKER_ANSWER_ENDPOINT: str = "ai-orchestrator-answer-v1"
+    SAGEMAKER_ROUTER_ENDPOINT: str = "ai-orchestrator-router-v1"
+    SAGEMAKER_SUMMARY_ENDPOINT: str = "i-orchestrator-memory-v1"
+    SAGEMAKER_VLM_ENDPOINT: str = "qwen25-vlm-async"
+    SAGEMAKER_TIMEOUT_SEC: int = 120
+
+    # 로컬 테스트용: 설정하면 boto3 대신 이 URL로 HTTP POST 호출
+    # 비어있으면 → boto3 (운영)
+    # http://localhost:9000 → tools/dummy_sagemaker.py로 HTTP (로컬 테스트)
+    SAGEMAKER_BASE_URL: str = ""
+
     # Embedding
     EMBEDDING_MODEL_NAME: str = "jhgan/ko-sroberta-multitask"
     EMBEDDING_DEVICE: str = "cpu"
@@ -52,14 +54,12 @@ class Settings(BaseSettings):
     PDF_CHUNK_OVERLAP: int = 100
     RAG_TOP_K: int = 4
 
-    # ---- v12: memory update policy ------------------------------------------
-    # user 턴 기준 N회마다 memory LLM 호출 (3=3턴에 1번)
+    # ---- memory update policy ------------------------------------------------
     MEMORY_UPDATE_EVERY_N_TURNS: int = 3
-    # update LLM에 넣을 직전 turn 수 (user 기준). 3턴이면 user+assistant 6메시지.
     MEMORY_UPDATE_WINDOW_TURNS: int = 3
 
-    # answer 생성 토큰 상한 (latency + 언어 드리프트 제어)
-    ANSWER_MAX_NEW_TOKENS: int = 200
+    # answer 생성 토큰 상한
+    ANSWER_MAX_NEW_TOKENS: int = 800
 
 
 settings = Settings()
