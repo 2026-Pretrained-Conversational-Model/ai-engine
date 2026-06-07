@@ -116,9 +116,14 @@ def _map_to_router_decision(
 
     # NO_RAG 분기
     if rag_response.reason_code == RagReasonCode.FILE_REQUIRED and has_doc:
-        return RouterDecision.RETRIEVE_DOC, "no_rag+file_required+doc"
+        return RouterDecision.RETRIEVE_DOC
 
-    return RouterDecision.DIRECT_ANSWER, f"no_rag:{rag_response.reason_code.value}"
+    if rag_response.reason_code == RagReasonCode.AMBIGUOUS_BUT_NOT_RAG:
+        summary_exists = bool(session.pdf_state.doc_summary.one_line)
+        if not session.conversation.recent_messages and not summary_exists:
+            return RouterDecision.DIRECT_ANSWER
+    
+    return RouterDecision.DIRECT_ANSWER
 
 
 # ---------------------------------------------------------------------------
