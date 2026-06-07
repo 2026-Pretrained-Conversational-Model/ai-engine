@@ -1,0 +1,85 @@
+# =============================================================
+# Dockerfile.gpu — RunPod GPU 배포용
+#
+# 구조:
+#   pytorch/pytorch CUDA base
+#   → pip install (torch 제외, 이미 베이스에 포함)
+#   → ai-orchestrator 앱 코드 복사
+#   → entrypoint.py (모델 로드 + uvicorn 실행)
+#
+# 빌드:
+#   docker build -f Dockerfile.gpu -t ai-orchestrator-gpu:latest .
+#
+# 로컬 테스트 (GPU 있는 머신):
+#   docker run --rm --gpus all -p 8000:8000 \
+#     -v hf_cache:/root/.cache/huggingface \
+#     ai-orchestrator-gpu:latest
+#
+# RunPod:
+#   Docker Hub에 push 후 Pod 생성 시 이미지 지정
+#   Expose HTTP Port: 8000
+# =============================================================
+
+FROM pytorch/pytorch:2.4.1-cuda12.4-cudnn9-runtime
+
+# ---- 시스템 패키지 ----
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        build-essential \
+        libgomp1 \
+        curl \
+        git \
+    && rm -rf /var/lib/apt/lists/*
+
+# ---- Python 환경 ----
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PIP_NO_CACHE_DIR=1
+
+WORKDIR /app
+
+# ---- pip 의존성 ----
+# 순서가 중요!
+#   1) requirements.gpu.txt (torch 제외 — 베이스 이미지에 포함)
+#   2) torchvision, torchaudio (베이스 runtime 이미지엔 빠져있을 수 있음)
+#      --no-deps로 설치해야 CPU용 torch를 끌어오지 않음
+#   3) numpy 강제 핀 — sentence-transformers 등이 numpy 2.x를 끌어와서
+#      torch/transformers와 충돌남. 반드시 마지막에 덮어쓰기.
+COPY requirements.gpu.txt .
+RUN pip install -r requirements.gpu.txt \
+    && pip install --no-deps torchvision torchaudio \
+    && pip uninstall -y numpy \
+    && pip install --no-cache-dir --force-reinstall "numpy==1.26.4"
+
+# ---- 앱 소스 복사 ----
+COPY app ./app
+COPY entrypoint.py .
+
+# ---- 디렉토리 준비 ----
+RUN mkdir -p /tmp/ai-orchestrator /workspace/logs
+
+# ---- 환경변수 기본값 (RunPod에서 오버라이드 가능) ----
+ENV LLM_BACKEND=local \
+    EMBEDDING_MODEL_NAME=jhgan/ko-sroberta-multitask \
+    EMBEDDING_DIM=768 \
+    EMBEDDING_DEVICE=cuda \
+    LOCAL_FILE_DIR=/tmp/ai-orchestrator \
+    SESSION_MAX_BYTES=20971520 \
+    MEMORY_UPDATE_EVERY_N_TURNS=3 \
+    MEMORY_UPDATE_WINDOW_TURNS=3 \
+    ANSWER_MAX_NEW_TOKENS=800 \
+    ANSWER_MODEL_ID=Qwen/Qwen2.5-7B-Instruct \
+    ROUTER_MODEL_ID=Qwen/Qwen2.5-3B-Instruct \
+    SUMMARY_MODEL_ID=Qwen/Qwen2.5-3B-Instruct \
+    BASE_QWEN_TOKENIZER_ID=Qwen/Qwen2.5-3B-Instruct \
+    USE_4BIT=true \
+    HOST=0.0.0.0 \
+    PORT=8000
+
+# ---- HuggingFace 캐시를 /workspace에 (RunPod volume 마운트 시 영속) ----
+ENV HF_HOME=/workspace/hf_cache \
+    TRANSFORMERS_CACHE=/workspace/hf_cache
+
+EXPOSE 8000
+
+# ---- 진입점: 모델 로드 → uvicorn 실행 ----
+CMD ["python", "entrypoint.py"]
